@@ -43,44 +43,74 @@ Claude > [calls mcp__dora__search]
        >    the shape — same lesson stash's BaseEmbedder teaches."
 ```
 
-## How to try it (5 minutes)
+## Install
 
-You need Rust installed (`brew install rust` or [rustup.rs](https://rustup.rs/)).
+### macOS — Apple Silicon (recommended)
+
+Download the prebuilt binary from the latest release:
 
 ```sh
-# 1. Build dora
-git clone <this repo>
+# Download + install in one go
+curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.1.0-macos-arm64
+chmod +x /tmp/dora
+xattr -d com.apple.quarantine /tmp/dora 2>/dev/null   # bypass macOS Gatekeeper warning
+sudo mv /tmp/dora /usr/local/bin/dora                  # or anywhere on your $PATH
+dora --version                                          # should print: dora 0.1.0
+```
+
+> **macOS Gatekeeper note**: the binary is unsigned. The `xattr` line removes the quarantine attribute so Gatekeeper doesn't warn. If you skip it, the first launch will say *"cannot be opened because the developer cannot be verified"* — fix with: right-click the binary in Finder → Open → "Open Anyway." Or run the `xattr` line above.
+
+### Intel Mac / Linux / latest `main`
+
+Build from source. You need Rust installed (`brew install rust` or [rustup.rs](https://rustup.rs/)).
+
+```sh
+git clone git@github.com:rach/dora.git
 cd dora
 cargo build --release
+sudo cp target/release/dora /usr/local/bin/dora
+dora --version
+```
 
-# 2. Index a folder of notes
-~/path/to/dora/target/release/dora index ~/path/to/your/notes
+(Cross-platform prebuilt binaries via GitHub Actions are planned but not yet shipped.)
 
-# 3. Register it
-~/path/to/dora/target/release/dora source add ~/path/to/your/notes
+## First run (5 minutes)
 
-# 4. Wire it into Claude Code (+ Cursor + Codex if you have them) + add shell wrappers
-~/path/to/dora/target/release/dora install
+```sh
+# 1. Index a folder of notes
+dora index ~/path/to/your/notes
 
-# 5. Verify
-~/path/to/dora/target/release/dora doctor
+# 2. Register it in the global registry
+dora source add ~/path/to/your/notes
+
+# 3. Patch Claude Code (+ Cursor + Codex) MCP configs + install shell wrappers
+dora install
+
+# 4. Verify everything's wired up
+dora doctor
 ```
 
 Then restart Claude Code (or Cursor / Codex). It'll see a `mcp__dora__search` tool automatically.
 
 Try a query from the terminal:
+
 ```sh
 cd ~/path/to/your/notes
-~/path/to/dora/target/release/dora "what did I write about X?"
-# or, with the grep wrapper:
+dora "what did I write about X?"
+# or, after `dora install`, with the grep wrapper:
 grep "what did I write about X?"
 ```
 
 You can register more folders any time:
+
 ```sh
-dora index ~/work/notes && dora source add ~/work/notes --name work \
+dora index ~/work/notes
+dora source add ~/work/notes --name work \
   --description "Work meeting notes + design docs"
-dora index ~/code-snippets && dora source add ~/code-snippets --name snippets
+
+dora index ~/code-snippets
+dora source add ~/code-snippets --name snippets
+
 dora source list
 ```
 
