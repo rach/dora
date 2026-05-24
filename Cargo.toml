@@ -1,8 +1,8 @@
 [package]
 name = "dora-fs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Personal memory for an Obsidian vault — semantic grep + MCP, single binary, local-only."
+description = "Personal semantic memory for notes and code — single Rust binary, tree-sitter code chunking, MCP-first."
 license = "MIT"
 
 [[bin]]
@@ -27,6 +27,18 @@ rmcp       = { version = "1.7", features = ["server", "transport-io"] }
 schemars   = "1"
 dirs       = "5"
 notify     = "6"
+
+# Code chunking (v0.2). tree-sitter + per-language grammars. tree-sitter-tags reads each
+# grammar's queries/tags.scm to find definitions/references — we don't write those queries.
+tree-sitter            = "0.25"
+tree-sitter-tags       = "0.25"
+tree-sitter-rust       = "0.24"
+tree-sitter-python     = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-go         = "0.23"
+tree-sitter-java       = "0.23"
+tree-sitter-ruby       = "0.23"
 
 [profile.release]
 lto = "thin"

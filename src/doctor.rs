@@ -223,15 +223,44 @@ fn check_registry() -> Vec<Check> {
             }
         }
 
+        // Per-source mode + (for code sources) chunk-kind breakdown. Read directly from
+        // the resolved Config and the chunks table — cheap (just COUNT + GROUP BY).
+        let mode_str = cfg.source.mode.as_str();
+        let kind_breakdown = chunk_kind_breakdown(&store).unwrap_or_default();
+        let kind_summary = if kind_breakdown.is_empty() {
+            String::new()
+        } else {
+            // Show non-prose kinds for code sources, else just "prose=N".
+            let prose_only = kind_breakdown.iter().all(|(k, _)| k == "prose");
+            if prose_only {
+                String::new()
+            } else {
+                let parts: Vec<String> = kind_breakdown
+                    .iter()
+                    .filter(|(k, _)| k != "prose")
+                    .map(|(k, n)| format!("{k}={n}"))
+                    .collect();
+                format!(", {}", parts.join(" "))
+            }
+        };
+        let link_summary = match store.count_links().ok() {
+            Some(n) if n > 0 => format!(", {n} links"),
+            _ => String::new(),
+        };
+
         let detail = if detail_parts.is_empty() {
             format!(
-                "{}, embedder={}, walked {}",
+                "{}, mode={mode_str}, embedder={}{kind_summary}{link_summary}, walked {}",
                 src.path.display(),
                 meta_embedder.unwrap_or_default(),
                 human_ago(age)
             )
         } else {
-            format!("{} — {}", src.path.display(), detail_parts.join("; "))
+            format!(
+                "{} (mode={mode_str}) — {}",
+                src.path.display(),
+                detail_parts.join("; ")
+            )
         };
 
         out.push(Check {
@@ -241,6 +270,18 @@ fn check_registry() -> Vec<Check> {
         });
     }
     out
+}
+
+fn chunk_kind_breakdown(store: &Store) -> Result<Vec<(String, i64)>> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT kind, COUNT(*) FROM chunks GROUP BY kind ORDER BY COUNT(*) DESC")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 // ---------- MCP host configs ----------

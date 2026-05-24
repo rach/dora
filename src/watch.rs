@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::chunk::Chunker;
+use crate::chunk::{self, Chunker};
 use crate::config::Config;
 use crate::embed::{self, DynEmbedder};
-use crate::registry::{Registry, Source};
+use crate::registry::Source;
 use crate::store::Store;
 use crate::{check_meta, db_path, models_dir, run_incremental_index};
 
@@ -25,7 +25,7 @@ struct SourceCtx {
     root: PathBuf,
     cfg: Config,
     embedder: DynEmbedder,
-    chunker: Chunker,
+    chunker: Box<dyn Chunker>,
     store: Store,
 }
 
@@ -156,7 +156,7 @@ fn try_load(src: &Source, cache: &mut HashMap<String, DynEmbedder>) -> Result<So
             new
         }
     };
-    let chunker = Chunker::from_config(&cfg.chunking);
+    let chunker = chunk::from_config(&cfg, &root);
 
     let db = db_path(&root);
     if !db.exists() {

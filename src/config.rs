@@ -1,71 +1,70 @@
-//! User-facing TOML config at `<vault>/.dora/config.toml`.
+//! User-facing TOML config at `<source>/.dora/config.toml`.
 //!
-//! Every section + every key is optional. Missing file → all defaults. Defaults match the POC's
-//! hardcoded constants exactly, so an existing user with no config gets the same behavior.
+//! Two-layer resolution:
+//!   1. Parse the file (any field optional) into [`RawConfig`].
+//!   2. Resolve `[source] mode` (auto-detect if unset) → apply mode defaults → overlay explicit
+//!      user values from the file → final [`Config`].
+//!
+//! Most users only set `[source] mode = "..."` (or nothing at all, and let auto-detect fire).
+//! Power users override individual sections as needed.
 
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 
-/// Bumped whenever schema changes in a way old data can't read. Mismatch → require fresh index.
-/// v0 item B added mtime/size/content_hash columns to `files`; bumping forces a one-time rebuild.
-pub const SCHEMA_VERSION: &str = "2";
+use crate::mode::Mode;
 
-/// Bumped whenever the chunking algorithm changes in a way that would produce different chunks
-/// for the same input. Mismatch → drop chunks + reindex.
-pub const CHUNKER_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "3";
+pub const CHUNKER_VERSION: &str = "3";
 
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(default, deny_unknown_fields)]
+// ---------- final, resolved types (what the rest of the codebase reads) ----------
+
+#[derive(Debug, Clone)]
 pub struct Config {
+    pub source: SourceConfig,
     pub vault: VaultConfig,
     pub chunking: ChunkingConfig,
     pub search: SearchConfig,
     pub embedder: EmbedderConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
+pub struct SourceConfig {
+    /// Resolved mode as a canonical string (`"obsidian"` / `"notes"` / `"docs"` / `"code"`).
+    /// Never `"auto"` after resolution — that's only valid as a user input.
+    pub mode: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct VaultConfig {
     pub ignore: Vec<String>,
 }
 
-impl Default for VaultConfig {
-    fn default() -> Self {
-        Self {
-            ignore: vec![
-                ".obsidian".into(),
-                ".git".into(),
-                ".dora".into(),
-                "node_modules".into(),
-            ],
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct ChunkingConfig {
     pub target_bytes: usize,
     pub atomic_below_bytes: usize,
     pub overlap_bytes: usize,
 }
 
-impl Default for ChunkingConfig {
-    fn default() -> Self {
-        Self {
-            target_bytes: 1800,
-            atomic_below_bytes: 1600,
-            overlap_bytes: 270,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct SearchConfig {
     pub top_k: usize,
     pub collapse_per_file: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbedderConfig {
+    /// `"fastembed"` (default) or `"openai"`.
+    pub provider: String,
+    /// Model name. For fastembed: short name or full HF path. For openai: one of
+    /// `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`.
+    pub model: String,
+    /// Name of the env var holding the provider API key. Default `"OPENAI_API_KEY"`.
+    pub api_key_env: String,
+    /// Optional vector dimension override (openai's text-embedding-3-* only). When set,
+    /// participates in the canonical embedder id so changing it triggers a clean reindex.
+    pub dimensions: Option<usize>,
 }
 
 impl Default for SearchConfig {
@@ -77,21 +76,124 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+// ---------- raw, partial types parsed from the TOML file ----------
+
+#[derive(Debug, Deserialize, Default, Clone)]
 #[serde(default, deny_unknown_fields)]
-pub struct EmbedderConfig {
-    /// `"fastembed"` (default) or `"openai"`.
-    pub provider: String,
-    /// Model name. For fastembed: short name or full HF path (resolved in `embed::fastembed`).
-    /// For openai: one of `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`.
-    pub model: String,
-    /// Name of the env var holding the provider API key. Default `"OPENAI_API_KEY"`. Only
-    /// consulted by remote providers.
-    pub api_key_env: String,
-    /// Optional vector dimension override. Only supported by openai's text-embedding-3-*. When
-    /// set it participates in the canonical embedder id (`openai:text-embedding-3-small:dims=512`)
-    /// so changing it triggers a clean reindex.
-    pub dimensions: Option<usize>,
+struct RawConfig {
+    source: RawSourceConfig,
+    vault: RawVaultConfig,
+    chunking: RawChunkingConfig,
+    search: RawSearchConfig,
+    embedder: RawEmbedderConfig,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawSourceConfig {
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawVaultConfig {
+    ignore: Option<Vec<String>>,
+    /// Additional file extensions to walk, beyond the mode's defaults. Lets a code-mode user
+    /// also include `.toml` / `.md` etc. without disabling the rest.
+    extensions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawChunkingConfig {
+    target_bytes: Option<usize>,
+    atomic_below_bytes: Option<usize>,
+    overlap_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawSearchConfig {
+    top_k: Option<usize>,
+    collapse_per_file: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawEmbedderConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    api_key_env: Option<String>,
+    dimensions: Option<usize>,
+}
+
+// ---------- loader ----------
+
+impl Config {
+    pub fn load_or_default(source_root: &Path) -> Result<Self> {
+        let path = source_root.join(".dora").join("config.toml");
+        let raw: RawConfig = if path.exists() {
+            let text = std::fs::read_to_string(&path)?;
+            toml::from_str(&text)?
+        } else {
+            RawConfig::default()
+        };
+        Ok(Self::resolve(raw, source_root))
+    }
+
+    fn resolve(raw: RawConfig, source_root: &Path) -> Self {
+        let mode = Mode::resolve(&raw.source.mode, source_root);
+        let chunk_d = mode.chunking_defaults();
+        let embed_d = mode.embedder_defaults();
+        let vault_d = mode.vault_defaults();
+
+        let mut ignore = raw.vault.ignore.unwrap_or(vault_d.ignore);
+        // Always force-include the dora/git/node_modules basics so users can't accidentally
+        // wipe them by setting [vault] ignore = [].
+        for required in [".dora", ".git", "node_modules"] {
+            if !ignore.iter().any(|d| d == required) {
+                ignore.push(required.to_string());
+            }
+        }
+
+        let search_d = SearchConfig::default();
+
+        Config {
+            source: SourceConfig {
+                mode: mode.as_str().to_string(),
+            },
+            vault: VaultConfig { ignore },
+            chunking: ChunkingConfig {
+                target_bytes: raw.chunking.target_bytes.unwrap_or(chunk_d.target_bytes),
+                atomic_below_bytes: raw
+                    .chunking
+                    .atomic_below_bytes
+                    .unwrap_or(chunk_d.atomic_below_bytes),
+                overlap_bytes: raw.chunking.overlap_bytes.unwrap_or(chunk_d.overlap_bytes),
+            },
+            search: SearchConfig {
+                top_k: raw.search.top_k.unwrap_or(search_d.top_k),
+                collapse_per_file: raw
+                    .search
+                    .collapse_per_file
+                    .unwrap_or(search_d.collapse_per_file),
+            },
+            embedder: EmbedderConfig {
+                provider: raw.embedder.provider.unwrap_or(embed_d.provider),
+                model: raw.embedder.model.unwrap_or(embed_d.model),
+                api_key_env: raw.embedder.api_key_env.unwrap_or(embed_d.api_key_env),
+                dimensions: raw.embedder.dimensions.or(embed_d.dimensions),
+            },
+        }
+    }
+}
+
+impl Default for Config {
+    /// Used by tests / call sites that want a config without touching the filesystem. Resolves
+    /// against a non-existent path → mode defaults to `notes`.
+    fn default() -> Self {
+        Self::resolve(RawConfig::default(), Path::new("/__dora_default__"))
+    }
 }
 
 impl Default for EmbedderConfig {
@@ -102,17 +204,5 @@ impl Default for EmbedderConfig {
             api_key_env: "OPENAI_API_KEY".into(),
             dimensions: None,
         }
-    }
-}
-
-impl Config {
-    pub fn load_or_default(vault: &Path) -> Result<Self> {
-        let path = vault.join(".dora").join("config.toml");
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)?;
-        let cfg: Config = toml::from_str(&text)?;
-        Ok(cfg)
     }
 }

@@ -15,9 +15,13 @@ pub struct EntryStat {
     pub size: u64,
 }
 
-/// Walk the vault and return metadata for every `.md` file. Body bytes are NOT read.
-/// Maps to S3 `ListObjectsV2` when remote canon eventually arrives.
-pub fn list_entries(root: &Path, ignore_dirs: &[String]) -> Result<Vec<EntryStat>> {
+/// Walk the vault and return metadata for every file whose extension is in `allow_exts`.
+/// Body bytes are NOT read. Maps to S3 `ListObjectsV2` when remote canon eventually arrives.
+pub fn list_entries(
+    root: &Path,
+    ignore_dirs: &[String],
+    allow_exts: &[&str],
+) -> Result<Vec<EntryStat>> {
     let root = root.canonicalize().context("canonicalize vault root")?;
     let mut out = Vec::new();
 
@@ -44,7 +48,9 @@ pub fn list_entries(root: &Path, ignore_dirs: &[String]) -> Result<Vec<EntryStat
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry.path().extension().and_then(|s| s.to_str()) != Some("md") {
+        let ext = entry.path().extension().and_then(|s| s.to_str());
+        let Some(ext) = ext else { continue };
+        if !allow_exts.iter().any(|e| *e == ext) {
             continue;
         }
 

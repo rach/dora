@@ -1,0 +1,10 @@
+{
+  "name": "dora",
+  "description": "Claude skill bundle for dora — semantic search + symbol graph over code repos and notes vaults.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Rachid Belaid"
+  },
+  "repository": "https://github.com/rach/dora",
+  "homepage": "https://github.com/rach/dora"
+}

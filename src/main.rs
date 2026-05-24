@@ -4,6 +4,8 @@ mod doctor;
 mod embed;
 mod install;
 mod mcp;
+mod mode;
+mod pagerank;
 mod registry;
 mod search;
 mod store;
@@ -18,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::chunk::Chunker;
+type BoxedChunker = Box<dyn Chunker>;
 use crate::config::{Config, CHUNKER_VERSION, SCHEMA_VERSION};
 use crate::embed::{DynEmbedder, Embedder};
 use crate::store::{ChunkRow, Store};
@@ -144,6 +147,11 @@ enum SourceAction {
         /// Free-form description shown to agents in `list_sources` and in `search`'s schema.
         #[arg(long)]
         description: Option<String>,
+        /// Indexing mode. `obsidian` / `notes` / `docs` / `code` / `auto` (default).
+        /// Persisted to `.dora/config.toml` as `[source] mode = "..."`. If omitted, the mode
+        /// already in the config file is preserved; if there's no config, auto-detect runs.
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// Remove a source from the registry by name. Doesn't touch the source's `.dora/` dir.
     Remove {
@@ -288,10 +296,37 @@ fn cmd_doctor() -> Result<()> {
 
 fn cmd_source(action: SourceAction) -> Result<()> {
     match action {
-        SourceAction::Add { path, name, description } => {
+        SourceAction::Add { path, name, description, mode } => {
             let abs = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize {}", path.display()))?;
+            // If --mode was given, write/replace `[source] mode = "..."` in the source's
+            // config.toml *before* checking for the DB — so the user can do "add --mode code"
+            // on an unindexed dir, then run `dora index` and have it pick up the right mode.
+            if let Some(mode_str) = mode {
+                let parsed = crate::mode::Mode::parse(&mode_str).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid mode '{mode_str}'. valid: obsidian|notes|docs|code|auto"
+                    )
+                })?;
+                write_source_mode(&abs, parsed.as_str())?;
+                let resolved = crate::mode::Mode::resolve(&Some(mode_str.clone()), &abs);
+                println!(
+                    "mode: {} ({})",
+                    resolved.as_str(),
+                    crate::mode::detection_summary(&abs)
+                );
+            } else if !abs.join(".dora").join("config.toml").exists() {
+                // No explicit mode, no existing config — auto-detect + print what we'd choose
+                // so the user can confirm. Don't write the file: leaving config absent means
+                // `dora index` will re-detect each run, which is friendlier for evolving dirs.
+                let detected = crate::mode::Mode::detect(&abs);
+                println!(
+                    "mode: {} (auto-detected — {})",
+                    detected.as_str(),
+                    crate::mode::detection_summary(&abs)
+                );
+            }
             let db = abs.join(".dora").join("index.db");
             if !db.exists() {
                 bail!(
@@ -390,7 +425,7 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
 
     let cfg = Config::load_or_default(&vault).context("load config")?;
     let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&vault))?;
-    let chunker = Chunker::from_config(&cfg.chunking);
+    let chunker: BoxedChunker = chunk::from_config(&cfg, &vault);
 
     // If the existing DB was built with a different schema/chunker/embedder, drop it and
     // rebuild from scratch (the diff loop will then see "all files = Insert"). No external
@@ -435,7 +470,7 @@ fn cmd_search(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool
     let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
     let mut store = Store::open(&db, embedder.dims())?;
     check_meta(&store, embedder.as_ref())?;
-    let chunker = Chunker::from_config(&cfg.chunking);
+    let chunker: BoxedChunker = chunk::from_config(&cfg, &source_root);
 
     // Derive source name: if cwd is registered, use the registered name; else use basename.
     let source_name = registry::find_source_name_for_path(&source_root).unwrap_or_else(|| {
@@ -486,7 +521,7 @@ pub(crate) fn search_with_self_heal(
     source_name: &str,
     cfg: &Config,
     store: &mut Store,
-    chunker: &Chunker,
+    chunker: &dyn Chunker,
     embedder: &dyn Embedder,
     query: &str,
     top_k: usize,
@@ -529,19 +564,23 @@ struct EmbedWork {
     size: u64,
     content_hash: String,
     chunks: Vec<chunk::Chunk>,
+    edges: Vec<chunk::EdgeSpec>,
     inputs: Vec<String>, // path/heading-prepended text fed to the embedder
 }
 
 fn run_incremental_index(
     vault: &Path,
     cfg: &Config,
-    chunker: &Chunker,
+    chunker: &dyn Chunker,
     embedder: &dyn Embedder,
     store: &mut Store,
     dry_run: bool,
 ) -> Result<DiffSummary> {
-    // Phase 1: list entries (metadata only — no body reads).
-    let entries = vault::list_entries(vault, &cfg.vault.ignore)?;
+    // Phase 1: list entries (metadata only — no body reads). Extension allow-list comes
+    // from the resolved mode so code sources walk .rs/.py/.ts/etc., not just .md.
+    let mode = crate::mode::Mode::parse(&cfg.source.mode).unwrap_or(crate::mode::Mode::Notes);
+    let allow_exts = mode.extensions();
+    let entries = vault::list_entries(vault, &cfg.vault.ignore, allow_exts)?;
 
     // Phase 2: diff against existing files.
     let existing = store.list_files()?;
@@ -620,10 +659,11 @@ fn run_incremental_index(
             .with_extension("")
             .to_string_lossy()
             .to_string();
-        let chunks = chunker.chunk(content, &rel_no_ext);
+        let chunks = chunker.chunk(content, path);
         if chunks.is_empty() {
             return;
         }
+        let edges = chunker.edges(content, path, &chunks);
         let inputs: Vec<String> = chunks
             .iter()
             .map(|c| chunk::embedded_text(&rel_no_ext, &c.heading_path, &c.content))
@@ -635,6 +675,7 @@ fn run_incremental_index(
             size,
             content_hash: hash.to_string(),
             chunks,
+            edges,
             inputs,
         });
     };
@@ -697,6 +738,7 @@ fn run_incremental_index(
     }
 
     // Phase 7: embed + upsert per-file (per-file transaction inside Store::upsert).
+    let mut any_edges = false;
     for w in &work {
         let embeddings = embedder.embed(&w.inputs)?;
         let rows: Vec<ChunkRow> = w
@@ -710,13 +752,43 @@ fn run_incremental_index(
                 start_byte: c.start_byte,
                 end_byte: c.end_byte,
                 embedding: e,
+                kind: chunk_kind_str(c.kind),
+                symbol: c.symbol.as_deref(),
+                parent_chunk_idx: c.parent_chunk_idx,
             })
             .collect();
-        store.upsert_file_with_chunks(&w.path, w.mtime, w.size, &w.content_hash, &rows)?;
+        let link_rows: Vec<crate::store::LinkRow> = w
+            .edges
+            .iter()
+            .map(|e| crate::store::LinkRow {
+                source_chunk_idx: e.source_chunk_idx,
+                kind: edge_kind_str(e.kind),
+                target_symbol: &e.target_symbol,
+                target_path: e.target_path.as_deref(),
+            })
+            .collect();
+        if !link_rows.is_empty() {
+            any_edges = true;
+        }
+        store.upsert_file_with_chunks(
+            &w.path,
+            w.mtime,
+            w.size,
+            &w.content_hash,
+            &rows,
+            &link_rows,
+        )?;
         match w.kind {
             WorkKind::Insert => summary.inserted += 1,
             WorkKind::Update => summary.updated += 1,
         }
+    }
+
+    // Phase 7b: pass-2 cross-file edge resolution. Only meaningful for code sources, but
+    // running it on a markdown-only source is a no-op (no links rows exist). Also runs
+    // when files were deleted/renamed, since SET NULL may have orphaned links.
+    if any_edges || !to_delete.is_empty() || !to_rename.is_empty() {
+        let _resolved = store.resolve_cross_file_links()?;
     }
 
     // Phase 8: bump last_walk_at so cmd_search debounces.
@@ -725,11 +797,43 @@ fn run_incremental_index(
     Ok(summary)
 }
 
+fn chunk_kind_str(k: chunk::ChunkKind) -> &'static str {
+    use chunk::ChunkKind::*;
+    match k {
+        Prose => "prose",
+        Function => "function",
+        Method => "method",
+        Class => "class",
+        Struct => "struct",
+        Trait => "trait",
+        Interface => "interface",
+        Impl => "impl",
+        Enum => "enum",
+        Module => "module",
+        Const => "const",
+        Macro => "macro",
+    }
+}
+
+fn edge_kind_str(k: chunk::EdgeKind) -> &'static str {
+    use chunk::EdgeKind::*;
+    match k {
+        Calls => "calls",
+        References => "references",
+        Implements => "implements",
+        Imports => "imports",
+        Extends => "extends",
+    }
+}
+
 // ---------------- meta helpers ----------------
 
 /// Quick read-only check whether the existing DB's identity matches the current binary + config.
+/// Opens the connection without running `create_schema` so a stale DB with the previous schema
+/// can be detected (and then wiped) without first tripping on a CREATE INDEX referencing a
+/// column the old schema doesn't have.
 fn meta_matches(db_path: &Path, embedder: &dyn Embedder) -> Result<bool> {
-    let store = Store::open(db_path, embedder.dims())?;
+    let conn = rusqlite::Connection::open(db_path).context("open sqlite db (meta check)")?;
     let want = [
         ("schema_version", SCHEMA_VERSION.to_string()),
         ("chunker_version", CHUNKER_VERSION.to_string()),
@@ -737,8 +841,13 @@ fn meta_matches(db_path: &Path, embedder: &dyn Embedder) -> Result<bool> {
         ("embedder_dims", embedder.dims().to_string()),
     ];
     for (key, expected) in want {
-        match store.get_meta(key)? {
-            Some(got) if got == expected => continue,
+        let got: Result<String, _> = conn.query_row(
+            "SELECT value FROM meta WHERE key = ?",
+            rusqlite::params![key],
+            |r| r.get(0),
+        );
+        match got {
+            Ok(v) if v == expected => continue,
             _ => return Ok(false),
         }
     }
@@ -775,6 +884,71 @@ fn check_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
             ),
         }
     }
+    Ok(())
+}
+
+/// Write `[source] mode = "<value>"` into `<root>/.dora/config.toml`, preserving every
+/// other line in the file. If the file doesn't exist yet, creates a minimal one. We do
+/// line-level surgery rather than load → mutate → toml::to_string because the TOML library
+/// drops comments + formatting on round-trip, which would be hostile to user-edited files.
+fn write_source_mode(root: &Path, mode: &str) -> Result<()> {
+    let dora = root.join(".dora");
+    std::fs::create_dir_all(&dora).with_context(|| format!("mkdir {}", dora.display()))?;
+    let path = dora.join("config.toml");
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let new_assignment = format!("mode = \"{mode}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut out = String::new();
+    let mut in_source_section = false;
+    let mut wrote_mode = false;
+    let mut has_source_section = false;
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Leaving the previous section. If we were in [source] and never wrote the mode,
+            // append it now.
+            if in_source_section && !wrote_mode {
+                out.push_str(&new_assignment);
+                out.push('\n');
+                wrote_mode = true;
+            }
+            in_source_section = trimmed == "[source]";
+            if in_source_section {
+                has_source_section = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_source_section && trimmed.starts_with("mode") && trimmed.contains('=') {
+            out.push_str(&new_assignment);
+            out.push('\n');
+            wrote_mode = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_source_section && !wrote_mode {
+        out.push_str(&new_assignment);
+        out.push('\n');
+        wrote_mode = true;
+    }
+    if !has_source_section {
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str("[source]\n");
+        out.push_str(&new_assignment);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-//! Adaptive markdown chunker.
+//! Adaptive markdown chunker (was `src/chunk.rs` through v0.1).
 //!
 //! Three behaviors, picked per-file:
 //!   - Tiny files become one atomic chunk.
@@ -13,25 +13,17 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+use crate::chunk::{Chunk, ChunkKind, Chunker};
 use crate::config::ChunkingConfig;
 
-#[derive(Debug, Clone)]
-pub struct Chunk {
-    pub idx: usize,
-    pub heading_path: String,
-    pub content: String,
-    pub start_byte: usize,
-    pub end_byte: usize,
-}
-
 /// Holds the size knobs for chunking. One per `dora` run; configured from `ChunkingConfig`.
-pub struct Chunker {
+pub struct MarkdownChunker {
     pub target_bytes: usize,
     pub atomic_below_bytes: usize,
     pub overlap_bytes: usize,
 }
 
-impl Chunker {
+impl MarkdownChunker {
     pub fn from_config(cfg: &ChunkingConfig) -> Self {
         Self {
             target_bytes: cfg.target_bytes,
@@ -39,37 +31,32 @@ impl Chunker {
             overlap_bytes: cfg.overlap_bytes,
         }
     }
+}
 
-    /// `rel_path_no_ext` is used to synthesize a prose body when the file is essentially
-    /// frontmatter-only. Pass "" if unknown — synthesis falls back to title-less prose.
-    pub fn chunk(&self, text: &str, rel_path_no_ext: &str) -> Vec<Chunk> {
+impl Chunker for MarkdownChunker {
+    fn chunk(&self, text: &str, rel_path: &str) -> Vec<Chunk> {
         if text.trim().is_empty() {
             return Vec::new();
         }
 
+        // Synthesis title uses the basename without extension — strip here so callers can
+        // pass the path-with-extension shape the trait expects.
+        let rel_path_no_ext: String = std::path::Path::new(rel_path)
+            .with_extension("")
+            .to_string_lossy()
+            .into_owned();
+
         if let (Some(fm), body) = split_frontmatter(text) {
             if body.trim().len() < 50 {
-                let synthesized = synthesize_from_frontmatter(rel_path_no_ext, fm);
+                let synthesized = synthesize_from_frontmatter(&rel_path_no_ext, fm);
                 if !synthesized.trim().is_empty() {
-                    return vec![Chunk {
-                        idx: 0,
-                        heading_path: String::new(),
-                        content: synthesized,
-                        start_byte: 0,
-                        end_byte: text.len(),
-                    }];
+                    return vec![prose_chunk(0, String::new(), synthesized, 0, text.len())];
                 }
             }
         }
 
         if text.len() <= self.atomic_below_bytes {
-            return vec![Chunk {
-                idx: 0,
-                heading_path: String::new(),
-                content: text.to_string(),
-                start_byte: 0,
-                end_byte: text.len(),
-            }];
+            return vec![prose_chunk(0, String::new(), text.to_string(), 0, text.len())];
         }
 
         let sections = split_by_headings(text);
@@ -79,30 +66,49 @@ impl Chunker {
 
         for section in sections {
             if section.content.len() <= self.target_bytes {
-                out.push(Chunk {
+                out.push(prose_chunk(
                     idx,
-                    heading_path: section.heading_path.clone(),
-                    content: section.content,
-                    start_byte: section.start_byte,
-                    end_byte: section.end_byte,
-                });
+                    section.heading_path.clone(),
+                    section.content,
+                    section.start_byte,
+                    section.end_byte,
+                ));
                 idx += 1;
                 continue;
             }
 
             for window in self.recursive_split(&section) {
-                out.push(Chunk {
+                out.push(prose_chunk(
                     idx,
-                    heading_path: section.heading_path.clone(),
-                    content: window.content,
-                    start_byte: window.start_byte,
-                    end_byte: window.end_byte,
-                });
+                    section.heading_path.clone(),
+                    window.content,
+                    window.start_byte,
+                    window.end_byte,
+                ));
                 idx += 1;
             }
         }
 
         out
+    }
+}
+
+fn prose_chunk(
+    idx: usize,
+    heading_path: String,
+    content: String,
+    start_byte: usize,
+    end_byte: usize,
+) -> Chunk {
+    Chunk {
+        idx,
+        heading_path,
+        content,
+        start_byte,
+        end_byte,
+        kind: ChunkKind::Prose,
+        symbol: None,
+        parent_chunk_idx: None,
     }
 }
 
@@ -207,7 +213,7 @@ struct Block {
     end_byte: usize,
 }
 
-impl Chunker {
+impl MarkdownChunker {
     fn recursive_split(&self, section: &Section) -> Vec<Window> {
         let blocks = paragraph_blocks(&section.content, section.start_byte);
         if blocks.is_empty() {
@@ -359,15 +365,6 @@ fn heading_regex() -> &'static Regex {
 fn is_fence_line(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("```") || t.starts_with("~~~")
-}
-
-/// What gets fed to the embedder: path/heading anchor + chunk text.
-pub fn embedded_text(rel_path_no_ext: &str, heading_path: &str, content: &str) -> String {
-    if heading_path.is_empty() {
-        format!("{rel_path_no_ext}\n\n{content}")
-    } else {
-        format!("{rel_path_no_ext}\n{heading_path}\n\n{content}")
-    }
 }
 
 // ------------- frontmatter handling for body-trivial files -------------

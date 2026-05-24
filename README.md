@@ -4,15 +4,17 @@
 
 ---
 
-**dora turns a folder of markdown notes into something Claude (and Cursor / Codex) can search by meaning, not just keywords.**
+**dora turns a folder of notes — or a code repo — into something Claude (and Cursor / Codex) can search by meaning, navigate by symbol, and rank by relevance, not just by keyword.**
 
-You point dora at a directory — your Obsidian vault, work notes, project docs, anything with `.md` files. It builds a tiny local search index next to those files. Then:
+You point dora at a directory — your Obsidian vault, work notes, project docs, *or a Rust/Python/TS/Go/Java/Ruby codebase*. It builds a tiny local search index next to those files. Then:
 
-- **From Claude Code**: ask *"what did I write about hook design?"* and Claude pulls the actual passage from your notes.
-- **From your terminal**: type `grep "the bit I half-remember about ranking algorithms"` and get the right note ranked first.
+- **From Claude Code**: ask *"what did I write about hook design?"* and Claude pulls the actual passage. Or *"where is `Embedder` implemented?"* and it pulls the impls — by symbol, not by grep.
+- **From your terminal**: type `grep "the bit I half-remember about ranking"` and get the right note ranked first.
 - **As a tool you call directly**: `dora "any natural language query"` returns ranked hits with a one-line excerpt.
 
-That's the whole product. One small binary. Local-only by default — no API key, no cloud, no daemon running in the background, no kernel-level filesystem trickery. If you want cloud embeddings (OpenAI) for better quality, that's a one-line config change.
+For code, dora ships with `find_definition`, `find_callers`, `find_implementations`, and `repo_map` (PageRank-ranked outline of the most important files for what you're currently editing).
+
+That's the whole product. One small binary. Local-only by default — no API key, no cloud, no daemon, no kernel-level filesystem trickery. If you want cloud embeddings (OpenAI) for better quality, that's a one-line config change.
 
 ## What it actually looks like
 
@@ -45,7 +47,7 @@ Claude > [calls mcp__dora__search]
 > macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux binaries are coming; for now, those platforms need to wait or build from source themselves.
 
 ```sh
-curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.1.0-macos-arm64
+curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.2.0-macos-arm64
 chmod +x /tmp/dora
 xattr -d com.apple.quarantine /tmp/dora 2>/dev/null   # bypass macOS Gatekeeper warning
 sudo mv /tmp/dora /usr/local/bin/dora                  # or anywhere on your $PATH
@@ -55,7 +57,7 @@ dora --version
 You should see:
 
 ```
-dora 0.1.0
+dora 0.2.0
 ```
 
 > **About the Gatekeeper line**: the binary isn't code-signed (signing requires a $99/yr Apple developer account I haven't paid for). The `xattr` line removes the quarantine flag macOS adds to downloads, so it'll launch without complaining. If you skip it, the first run shows *"cannot be opened because the developer cannot be verified"* — right-click in Finder → Open → "Open Anyway" gets past it.
@@ -152,6 +154,23 @@ Shell wrappers:
 
 **Restart Claude Code** (and Cursor / Codex) so they pick up the new MCP server.
 
+### Step 4.5 — (Optional) Install the bundled `dora` skill
+
+Without this skill, Claude often still reaches for `Grep` when you ask code or notes questions — exactly the failure mode dora was built to fix. The bundled skill tells Claude *when* to prefer dora's MCP tools (`find_definition`, `find_callers`, `repo_map`, `search`, etc.). Quickest install:
+
+```sh
+npx skills add rach/dora
+```
+
+Or via the Claude Code plugin marketplace:
+
+```
+/plugin marketplace add github.com/rach/dora
+/plugin install dora@dora
+```
+
+Full options (manual symlink, per-project install, troubleshooting) in [skills/README.md](skills/README.md).
+
 ### Step 5 — Verify everything's healthy
 
 ```sh
@@ -221,19 +240,78 @@ nohup dora watch > /tmp/dora-watch.log 2>&1 &
 
 **Multi-folder.** All registered folders are searchable from a single MCP server (one process, one model in memory). Claude can scope a search to one folder by name, or search across everything and merge results.
 
+## Modes
+
+A *mode* is a complete preset — chunker, embedder, file-extension filter, and ignore-directories — that you pick (or auto-detect) per source. Set it via `dora source add --mode <mode>` or by editing `[source] mode = "..."` in the source's `.dora/config.toml`.
+
+| Mode | Chunker | Default embedder | File extensions | Auto-detect trigger |
+|---|---|---|---|---|
+| `obsidian` | adaptive markdown + frontmatter synthesis | `bge-small-en-v1.5` | `.md` | `.obsidian/` directory exists |
+| `notes` | adaptive markdown | `bge-small-en-v1.5` | `.md` | `.md` files majority, no `.obsidian/` |
+| `docs` | adaptive markdown, smaller chunks | `bge-small-en-v1.5` | `.md`, `.mdx`, `.rst` | explicit only |
+| `code` | tree-sitter (6-language registry) | `jina-embeddings-v2-base-code` | `.rs`, `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.java`, `.rb` | code-extension majority |
+| `auto` | resolved at index time | (resolved) | (resolved) | default — runs the rules above |
+
+```sh
+$ dora source add ~/Dev/personal/brain
+mode: obsidian (auto-detected — `.obsidian/` directory present)
+added: brain -> /Users/me/Dev/personal/brain
+
+$ dora source add ~/Dev/myproject --mode code
+mode: code (412 .md files, 1873 code-extension files)
+added: myproject -> /Users/me/Dev/myproject
+```
+
+Modes are sensible defaults — every individual knob (`[chunking]`, `[embedder]`, `[vault] ignore`) can still be overridden in `.dora/config.toml`.
+
+## Using dora with code
+
+Pointed at a Rust / Python / TS+JS / Go / Java / Ruby repo with `--mode code`, dora chunks files structurally via tree-sitter (one chunk per function / method / class / etc.) and builds a symbol graph in the same SQLite DB. Five MCP tools become useful:
+
+- `mcp__dora__search(query, source?, ...)` — semantic search, same as for notes. Best for "find code that does X".
+- `mcp__dora__find_definition(symbol, source?)` — locate where a symbol is defined. Cheap, exact.
+- `mcp__dora__find_callers(symbol, source?, depth=1)` — recursive walk over the call graph. Each result carries `confidence: "exact" | "name_match"` (within-file or unique-name matches are `exact`; ambiguous matches across files are `name_match`).
+- `mcp__dora__find_implementations(symbol, source?)` — find implementations of a trait / interface (Rust `impl Trait for ...`, Java/TS `implements`).
+- `mcp__dora__repo_map(source, focus_paths=[], token_budget=2000)` — PageRank-ranked outline of the codebase. `focus_paths` (file path prefixes you're editing) biases ranking toward neighbors of those files. Aider's "what code matters for the current task" view.
+
+Tree-sitter only — no LSP required, no per-language setup, no language server processes hanging around. Cross-file edges are resolved by symbol-name match against the index; resolution rate is honest about ambiguity via the `confidence` field.
+
+Quickstart:
+
+```sh
+cd ~/Dev/myproject
+dora index             # auto-detects mode=code if code files dominate; first run downloads jina-embeddings-v2-base-code (~150 MB)
+dora source add . --mode code --description "myproject — Go backend"
+# from Claude Code:
+#   "where is `processRequest` defined?"           → find_definition
+#   "what calls `processRequest`?"                 → find_callers
+#   "give me a ranked outline of this repo,         → repo_map(focus_paths=[...])
+#    focused on backend/auth/"
+```
+
+`dora doctor` shows the per-source mode and chunk-kind breakdown:
+
+```
+REGISTRY
+  · registry      2 source(s) registered
+  ✓ brain         /Users/me/brain, mode=obsidian, embedder=fastembed:Xenova/bge-small-en-v1.5
+  ✓ myproject    /Users/me/Dev/myproject, mode=code, embedder=fastembed:jinaai/jina-embeddings-v2-base-code,
+                  function=412 method=288 class=156 module=47 interface=18, 9214 links
+```
+
 ## Commands
 
 ```
-dora index [<path>]                                    # build/update the index for <path> (defaults to cwd)
-dora "<query>" [--top-k N] [--json]                    # search the index in cwd
-dora source add <path> [--name N] [--description "…"]  # register a folder globally
-dora source list                                       # show registered folders
-dora source remove <name>                              # unregister
-dora source describe <name> "…"                        # update a folder's description
-dora install [--client …] [--include …] [--wrap …]     # patch MCP host configs + shell wrappers
-dora doctor                                            # health check, exit code reflects status
-dora mcp [--include …] [--exclude …] [--source <path>] # run the MCP server (usually called by Claude Code itself)
-dora watch [--include …] [--exclude …]                 # foreground watcher that keeps things fresh proactively
+dora index [<path>]                                              # build/update the index for <path> (defaults to cwd)
+dora "<query>" [--top-k N] [--json]                              # search the index in cwd
+dora source add <path> [--name N] [--description "…"] [--mode M] # register a folder; --mode obsidian|notes|docs|code|auto
+dora source list                                                 # show registered folders
+dora source remove <name>                                        # unregister
+dora source describe <name> "…"                                  # update a folder's description
+dora install [--client …] [--include …] [--wrap …]               # patch MCP host configs + shell wrappers
+dora doctor                                                      # health check, exit code reflects status
+dora mcp [--include …] [--exclude …] [--source <path>]           # run the MCP server (usually called by Claude Code itself)
+dora watch [--include …] [--exclude …]                           # foreground watcher that keeps things fresh proactively
 ```
 
 Every command has a `--help`. Full reference (with examples for each command, config file format, embedding-model choices, and Claude Code wiring details) is below.
@@ -323,10 +401,14 @@ nohup dora watch > /tmp/dora-watch.log &   # background it
 
 ### `dora mcp [--include …] [--exclude …] [--source <path>]`
 
-The MCP server, normally launched by Claude Code itself (via the config `dora install` patched in). Exposes two tools:
+The MCP server, normally launched by Claude Code itself (via the config `dora install` patched in). Exposes six tools:
 
-- `mcp__dora__search(query, source?, top_k?, path_prefix?)` — hybrid search, optionally scoped to one registered folder.
+- `mcp__dora__search(query, source?, top_k?, path_prefix?)` — hybrid search across notes *or* code.
 - `mcp__dora__list_sources()` — list registered folders with descriptions + counts.
+- `mcp__dora__find_definition(symbol, source?, limit?)` — code: locate where a symbol is defined.
+- `mcp__dora__find_callers(symbol, source?, depth?, limit?)` — code: who calls this function/method (recursive CTE, max depth 5).
+- `mcp__dora__find_implementations(symbol, source?, limit?)` — code: implementations of a trait / interface.
+- `mcp__dora__repo_map(source, focus_paths?, token_budget?)` — code: PageRank-ranked outline biased toward `focus_paths`.
 
 Concurrent processes are safe (WAL mode, per-file transactions, 5s busy timeout). Embedders are shared across folders that use the same model — three folders on the default model load the ONNX file once, not three times.
 
@@ -357,26 +439,35 @@ find . -name "*.md" -mtime -7
 
 ## Configuration (optional)
 
-Per-folder `.dora/config.toml` — every key is optional with sensible defaults:
+Per-folder `.dora/config.toml` — every key is optional with sensible defaults. Most users only set `[source] mode`; the rest of the file picks up mode-appropriate defaults.
 
 ```toml
+[source]
+mode = "code"                  # obsidian | notes | docs | code | auto (default)
+
+# Optional overrides — leave blank unless you know you need them:
+
+[vault]
+# ignore     = [".dora", ".git", "node_modules", "target"]   # dirs to skip when walking
+# extensions = ["toml", "yaml"]                              # extra extensions to walk
+
 [chunking]
-target_bytes        = 1800     # chunk size target; ~450 tokens
-atomic_below_bytes  = 1600     # files smaller than this stay as one chunk
-overlap_bytes       = 270      # ~15% overlap on recursive paragraph splits
+# target_bytes        = 1800   # chunk size target; ~450 tokens
+# atomic_below_bytes  = 1600   # files smaller than this stay as one chunk
+# overlap_bytes       = 270    # ~15% overlap on recursive paragraph splits
 
 [embedder]
-provider    = "fastembed"      # or "openai"
-model       = "bge-small-en-v1.5"
-api_key_env = "OPENAI_API_KEY" # only for provider = "openai"
-# dimensions = 1024            # openai-only
+# provider    = "fastembed"    # or "openai"
+# model       = "bge-small-en-v1.5"
+# api_key_env = "OPENAI_API_KEY" # only for provider = "openai"
+# dimensions  = 1024           # openai-only
 
 [search]
-top_k             = 10
-collapse_per_file = true       # at most one hit per file
+# top_k             = 10
+# collapse_per_file = true     # at most one hit per file
 ```
 
-Switching `model` triggers a clean re-index on next run.
+Switching `mode` or `model` triggers a clean re-index on next run.
 
 **Local embedding models** (any of ~25 from fastembed's catalog): `bge-small-en-v1.5` (default), `bge-base-en-v1.5`, `bge-large-en-v1.5`, `multilingual-e5-small/base/large`, `all-minilm-l6-v2`, `nomic-embed-text-v1.5`, `jina-embeddings-v2-base-code`, `mxbai-embed-large-v1`, `modernbert-embed-large`, `bge-small-zh-v1.5`, `bge-large-zh-v1.5`, and more. Pick by name in config.
 
@@ -384,9 +475,11 @@ Switching `model` triggers a clean re-index on next run.
 
 ## Project status
 
-**Working end-to-end** — CLI, MCP, install/doctor, watcher, multi-source registry, four shell wrappers, OpenAI integration. Used daily against multiple personal vaults.
+**v0.2 ships code-aware sources.** Six languages on day 1 (Rust, Python, TS+JS, Go, Java, Ruby) via tree-sitter. Four new MCP tools — `find_definition`, `find_callers`, `find_implementations`, `repo_map`. PageRank scoring. Mode presets with auto-detection. Markdown sources from v0.1 continue working unchanged.
 
-**Not yet release-grade** — no automated tests, no Homebrew formula, prebuilt binary is Apple Silicon only. To try it on Intel Mac or Linux, clone + `cargo build --release` yourself.
+**Working end-to-end** — CLI, MCP, install/doctor, watcher, multi-source registry, four shell wrappers, OpenAI integration, code chunking + symbol graph. Used daily against multiple personal vaults + codebases.
+
+**Not yet release-grade** — no automated test corpus, no Homebrew formula, prebuilt binary is Apple Silicon only. To try it on Intel Mac or Linux, clone + `cargo build --release` yourself.
 
 ## License
 

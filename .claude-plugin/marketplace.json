@@ -1,0 +1,13 @@
+{
+  "name": "dora",
+  "owner": {
+    "name": "Rachid Belaid"
+  },
+  "plugins": [
+    {
+      "name": "dora",
+      "source": ".",
+      "description": "Steers Claude Code toward dora's MCP tools (search, find_definition, find_callers, find_implementations, repo_map) for code repos and notes vaults registered with dora."
+    }
+  ]
+}
