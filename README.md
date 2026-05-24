@@ -1,8 +1,5 @@
 <div align="center">
   <img src="assets/dora.png" alt="dora — the file explorer" width="280">
-
-  <h1>dora</h1>
-  <p><em>the file explorer</em></p>
 </div>
 
 ---
