@@ -260,7 +260,7 @@ dora's incremental indexing means re-running `dora index` is cheap. Queries also
 
 **Indexing.** dora reads each `.md` file, splits it into chunks (respecting headings, code blocks, tables), generates a vector embedding per chunk using a small local ML model (default: BGE-small, ~80 MB ONNX file that runs on your laptop). Stores everything in SQLite.
 
-**Searching.** When you query, dora embeds the query the same way, then does two searches in parallel: a keyword-based one (BM25 / FTS5) and a vector-similarity one. It merges the two ranked lists with a technique called Reciprocal Rank Fusion. You get the top N results back.
+**Searching.** When you query, dora embeds the query the same way, then runs three searches in parallel: a keyword-based one (BM25 / FTS5), a vector-similarity one, and a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`). It merges the three ranked lists with Reciprocal Rank Fusion. You get the top N results back.
 
 **Incremental.** After the first index, only changed files get re-embedded. Detected via mtime + content hash. Renames are detected and don't re-embed. Even on a vault with 2,500+ chunks (e.g. the Rust Book), a no-op re-index takes about 130 milliseconds.
 

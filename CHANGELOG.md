@@ -4,6 +4,22 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-05-24
+
+### Changed
+
+- Hybrid search gains a third arm: a literal-substring `LIKE` scan over
+  `chunks.content`, merged into the existing FTS5 + vector RRF. Closes the gaps
+  where FTS5's tokenization can't help — camelCase identifiers
+  (`processRequest`), snake_case adjacency (`foo_bar`), magic constants
+  (`E_NOENT`, `MAX_RETRY_COUNT`), short error codes. Always on; the per-query
+  cost is invisible on personal-vault sizes.
+- `dora "upsert_file_with_chunks"` and similar literal-identifier queries now
+  return the right chunk directly, without falling through to `rg`. The skill's
+  anti-pattern carve-out for literal queries shrank accordingly.
+- Refactored `rrf_merge(fts, ann)` → `rrf_merge_n(&[…])` so future arms drop
+  in without further plumbing.
+
 ## [0.2.1] — 2026-05-24
 
 ### Added

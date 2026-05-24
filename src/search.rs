@@ -50,7 +50,23 @@ pub fn search(
             })
     };
 
-    let merged = rrf_merge(&fts, &ann);
+    // Third arm: literal substring scan. Closes the gaps where FTS5's tokenizer doesn't
+    // help — camelCase identifiers (`processRequest`), snake_case fragments (`foo_bar`),
+    // magic constants (`E_NOENT`). For natural-language queries this typically returns
+    // nothing (or noise that RRF discounts to the bottom), so it never hurts.
+    let trimmed_query = query.trim();
+    let literal = if trimmed_query.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .search_literal(trimmed_query, PER_LIST_LIMIT, path_prefix)
+            .unwrap_or_else(|err| {
+                eprintln!("literal query failed (continuing without it): {err}");
+                Vec::new()
+            })
+    };
+
+    let merged = rrf_merge_n(&[&fts, &ann, &literal]);
     // Per-file collapse: best chunk per file (default behavior for v0 OSS).
     let merged = collapse_per_file(&merged, store, top_k)?;
 
@@ -96,13 +112,14 @@ fn collapse_per_file(
     Ok(out)
 }
 
-fn rrf_merge(fts: &[i64], ann: &[i64]) -> Vec<(i64, f64)> {
+/// Reciprocal Rank Fusion across any number of ranked lists. Each list contributes
+/// `1 / (RRF_K + rank)` per occurrence; final list is sorted by summed score, descending.
+fn rrf_merge_n(lists: &[&[i64]]) -> Vec<(i64, f64)> {
     let mut scores: HashMap<i64, f64> = HashMap::new();
-    for (rank, id) in fts.iter().enumerate() {
-        *scores.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f64);
-    }
-    for (rank, id) in ann.iter().enumerate() {
-        *scores.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f64);
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            *scores.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f64);
+        }
     }
     let mut v: Vec<(i64, f64)> = scores.into_iter().collect();
     v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

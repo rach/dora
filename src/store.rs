@@ -627,6 +627,53 @@ impl Store {
         }
     }
 
+    /// Literal substring scan over `chunks.content` — the third RRF arm. Catches what
+    /// FTS5's tokenizer drops: camelCase fragments (`Request` inside `processRequest`),
+    /// snake_case adjacency (`foo_bar`), magic constants (`E_NOENT`, `MAX_RETRY_COUNT`).
+    /// SQLite LIKE is case-insensitive for ASCII and O(N) over the column; on personal-
+    /// vault sizes the per-query cost is invisible. `%`/`_`/`\\` in the query are escaped
+    /// so a user typing `foo_bar` matches `foo_bar` literally rather than `foo<anything>bar`.
+    pub fn search_literal(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<i64>> {
+        let pattern = format!("%{}%", escape_like(query));
+        match path_prefix {
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id FROM chunks WHERE content LIKE ? ESCAPE '\\' \
+                     ORDER BY id LIMIT ?",
+                )?;
+                let rows = stmt
+                    .query_map(params![pattern, limit as i64], |row| row.get::<_, i64>(0))?;
+                let mut hits = Vec::new();
+                for r in rows {
+                    hits.push(r?);
+                }
+                Ok(hits)
+            }
+            Some(prefix) => {
+                let path_like = format!("{}%", prefix);
+                let mut stmt = self.conn.prepare(
+                    "SELECT c.id FROM chunks c \
+                     JOIN files f ON f.id = c.file_id \
+                     WHERE c.content LIKE ? ESCAPE '\\' AND f.path LIKE ? \
+                     ORDER BY c.id LIMIT ?",
+                )?;
+                let rows = stmt.query_map(params![pattern, path_like, limit as i64], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let mut hits = Vec::new();
+                for r in rows {
+                    hits.push(r?);
+                }
+                Ok(hits)
+            }
+        }
+    }
+
     pub fn search_ann(
         &self,
         query_vec: &[f32],
@@ -727,6 +774,19 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// Escape `%`, `_`, and `\` in a string so it can be wrapped in `%…%` and used with
+/// `LIKE ? ESCAPE '\'`. Without this, a user query of `foo_bar` would match `foo<any>bar`.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {

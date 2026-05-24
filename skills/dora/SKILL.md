@@ -68,14 +68,13 @@ Notes mode uses a smaller toolset — `search` does most of the work.
 
 ## Step 4 — anti-patterns (when NOT to use dora)
 
-dora is for *semantic* and *structural* queries. Reach for the built-in tools instead when:
+dora is for *semantic* and *structural* queries. As of v0.2.2 it also handles literal-substring matching natively (camelCase, snake_case, magic constants, error codes), so most "exact string" queries belong in `search` too. Reach for the built-in tools instead when:
 
-- The user wants a **literal-string match**: error text, a URL, a specific log line, an `#obsidian-tag`.
-  → use `Grep` / `rg`. Faster and more precise.
-- The user wants **file-path patterns**: `*.test.ts`, `2026-05-*.md`, "every file in docs/".
-  → use `Glob`.
-- The repo is tiny (<100 files) and a quick `Grep` will scan it in <100ms.
-- You need to read a specific file you already know about. → `Read`.
+- **File-path patterns** (`*.test.ts`, `2026-05-*.md`, "every file in docs/") → `Glob`.
+- **`#obsidian-tag` searches** → `Grep` is exact and faster.
+- **Bulk literal scans over a folder dora hasn't indexed** → `Grep` / `rg`. dora only sees what's been registered + indexed.
+- **Tiny repos (<100 files)** where a `Grep` will scan in <100ms — no setup needed.
+- **Reading a specific file you already know about** → `Read`.
 
 It's totally fine to combine: `mcp__dora__search` to find the relevant chunks, then `Read` for
 full file context, then `Edit`. Don't force every step through dora.
