@@ -189,6 +189,30 @@ dora doctor
 
 You should see all green ✓ checks. If anything is `⚠` or `✗`, the message tells you what to fix.
 
+### Step 5.5 — (Optional) Run a background watcher
+
+Without a watcher, dora self-heals on every query (it diffs the vault if mtimes changed since the last walk). With one, you skip that mid-query catch-up and indexing is always already-fresh.
+
+If you installed via Homebrew, the easiest path is `brew services`:
+
+```sh
+brew services start dora        # launchd plist + watcher running
+brew services list              # shows status
+brew services stop dora         # to stop
+```
+
+That auto-restarts the watcher on login and on crash. Logs land in `/opt/homebrew/var/log/dora-watch.log`. **Safe to run before registering any sources** — the watcher waits and picks up the first `dora source add` automatically.
+
+Without Homebrew (or if you prefer foreground):
+
+```sh
+dora watch          # foreground; Ctrl-C to stop
+# or, send it to the background:
+nohup dora watch > /tmp/dora-watch.log 2>&1 &
+```
+
+The watcher auto-picks up any source you add later via `dora source add` — no restart needed. `dora source add` prints a hint telling you whether a watcher is already running or not.
+
 ### Step 6 — Use it from Claude Code
 
 In a fresh Claude Code session, ask Claude something that requires your notes:
@@ -218,13 +242,7 @@ If the underlying tool isn't installed (e.g., you don't have ripgrep), the wrapp
 
 ### Keeping things fresh
 
-dora's incremental indexing means re-running `dora index` is cheap. Queries also self-heal — if you've edited a file since the last index, the next query notices and quietly catches up before searching. So you don't *have* to do anything. But if you want results to be ready instantly without that mid-query refresh, run a watcher in the background:
-
-```sh
-dora watch          # foreground; Ctrl-C to stop
-# or
-nohup dora watch > /tmp/dora-watch.log 2>&1 &
-```
+dora's incremental indexing means re-running `dora index` is cheap. Queries also self-heal — if you've edited a file since the last index, the next query notices and quietly catches up before searching. So you don't *have* to do anything. If you want instant results without that mid-query refresh (and auto-pickup of newly-added sources), run `dora watch` — see [Step 5.5](#step-55--optional-run-a-background-watcher) above.
 
 ## What's happening under the hood
 

@@ -10,8 +10,6 @@
 //! sub-slice C). Files with zero tag matches get a single `Module` chunk covering the whole
 //! file so they're still searchable.
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Mutex;
 
 use tree_sitter::Language;

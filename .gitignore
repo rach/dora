@@ -2,3 +2,5 @@
 /.dora
 /test-corpora
 .claude/
+# local-only release recipe (see scripts/release.sh in this checkout)
+/scripts/release.sh

@@ -4,6 +4,25 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-24
+
+### Added
+
+- `brew services start dora` support. Tap formula gains a `service do … end` block
+  (`run [opt_bin/"dora", "watch"]`, `keep_alive true`, logs to
+  `/opt/homebrew/var/log/dora-watch.log`). Users on Homebrew can manage the watcher
+  with `brew services {start|stop|restart|list} dora` and it auto-restarts on login
+  and on crash.
+
+### Changed
+
+- `dora watch` no longer bails when the registry is empty. Instead, it logs
+  `no sources registered yet — waiting` and proceeds into the main loop; the
+  notify-on-registry hook (added in v0.2.0) picks up the first `dora source add`
+  whenever it lands. Required for the `brew services start dora` flow on a fresh
+  install — users can `brew install` + `brew services start dora` before
+  registering any source without launchd respawn-looping a failing process.
+
 ## [0.2.0] — 2026-05-24
 
 ### Added

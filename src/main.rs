@@ -276,12 +276,12 @@ fn cmd_install(
 
 fn cmd_watch(include: Vec<String>, exclude: Vec<String>) -> Result<()> {
     let mut reg = registry::Registry::load().context("load registry")?;
-    if reg.sources.is_empty() {
-        bail!(
-            "no sources registered. Add one with `dora source add <path>` before running `dora watch`."
-        );
+    // An empty registry isn't an error — the watcher waits and picks up the first
+    // `dora source add` via its notify subscription on the registry directory. This is
+    // load-bearing for `brew services start dora` on a fresh install.
+    if !include.is_empty() || !exclude.is_empty() {
+        filter_registry(&mut reg, &include, &exclude)?;
     }
-    filter_registry(&mut reg, &include, &exclude)?;
     watch::run(reg.sources)
 }
 
@@ -348,6 +348,15 @@ fn cmd_source(action: SourceAction) -> Result<()> {
             })?;
             reg.save().context("write registry")?;
             println!("added: {} -> {}", final_name, abs.display());
+            // Surface a one-line nudge about watch — uses kill -0 liveness so a stale
+            // PID file from a crashed watcher doesn't give the wrong hint.
+            if crate::watch::is_running() {
+                eprintln!("hint: dora watch is running — it'll pick up '{final_name}' automatically.");
+            } else {
+                eprintln!(
+                    "hint: run `dora watch` in the background to keep '{final_name}' indexed live."
+                );
+            }
             Ok(())
         }
         SourceAction::Remove { name } => {
