@@ -44,7 +44,17 @@ Claude > [calls mcp__dora__search]
 
 ## Install
 
-> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux binaries are coming; for now, those platforms need to wait or build from source themselves.
+> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux: build from source via `cargo install --git https://github.com/rach/dora --tag v0.2.0`.
+
+### Homebrew (recommended)
+
+```sh
+brew install rach/dora/dora
+```
+
+The first run auto-taps `rach/homebrew-dora`. Upgrade with `brew upgrade dora`.
+
+### Direct download
 
 ```sh
 curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.2.0-macos-arm64
@@ -54,13 +64,13 @@ sudo mv /tmp/dora /usr/local/bin/dora                  # or anywhere on your $PA
 dora --version
 ```
 
-You should see:
+Either path lands you at:
 
 ```
 dora 0.2.0
 ```
 
-> **About the Gatekeeper line**: the binary isn't code-signed (signing requires a $99/yr Apple developer account I haven't paid for). The `xattr` line removes the quarantine flag macOS adds to downloads, so it'll launch without complaining. If you skip it, the first run shows *"cannot be opened because the developer cannot be verified"* — right-click in Finder → Open → "Open Anyway" gets past it.
+> **About the Gatekeeper line** (direct-download path only): the binary isn't code-signed (signing requires a $99/yr Apple developer account I haven't paid for). The `xattr` line removes the quarantine flag macOS adds to downloads, so it'll launch without complaining. Homebrew's install path doesn't trip Gatekeeper. If you skip the `xattr` on a direct download, the first run shows *"cannot be opened because the developer cannot be verified"* — right-click in Finder → Open → "Open Anyway" gets past it.
 
 ## Tutorial — your first search in 5 minutes
 

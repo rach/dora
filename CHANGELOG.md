@@ -47,6 +47,11 @@ All notable changes to dora are documented here. Format roughly follows
   `/plugin install dora@dora`), or manual symlink. See [skills/README.md](skills/README.md).
 - Plugin marketplace manifests at `.claude-plugin/{marketplace,plugin}.json`
   so the dora repo doubles as a single-plugin Claude Code marketplace.
+- Homebrew tap at [rach/homebrew-dora](https://github.com/rach/homebrew-dora).
+  Install via `brew install rach/dora/dora`. The macOS Apple Silicon bottle
+  resolves to the v0.2.0 GitHub release tarball; Intel macOS + Linux users
+  are pointed at `cargo install --git https://github.com/rach/dora --tag v0.2.0`
+  pending cross-platform bottle support.
 
 ### Changed
 
