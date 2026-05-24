@@ -45,73 +45,159 @@ Claude > [calls mcp__dora__search]
 
 ## Install
 
-### macOS — Apple Silicon (recommended)
-
-Download the prebuilt binary from the latest release:
+> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux binaries are coming; for now, those platforms need to wait or build from source themselves.
 
 ```sh
-# Download + install in one go
 curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.1.0-macos-arm64
 chmod +x /tmp/dora
 xattr -d com.apple.quarantine /tmp/dora 2>/dev/null   # bypass macOS Gatekeeper warning
 sudo mv /tmp/dora /usr/local/bin/dora                  # or anywhere on your $PATH
-dora --version                                          # should print: dora 0.1.0
-```
-
-> **macOS Gatekeeper note**: the binary is unsigned. The `xattr` line removes the quarantine attribute so Gatekeeper doesn't warn. If you skip it, the first launch will say *"cannot be opened because the developer cannot be verified"* — fix with: right-click the binary in Finder → Open → "Open Anyway." Or run the `xattr` line above.
-
-### Intel Mac / Linux / latest `main`
-
-Build from source. You need Rust installed (`brew install rust` or [rustup.rs](https://rustup.rs/)).
-
-```sh
-git clone git@github.com:rach/dora.git
-cd dora
-cargo build --release
-sudo cp target/release/dora /usr/local/bin/dora
 dora --version
 ```
 
-(Cross-platform prebuilt binaries via GitHub Actions are planned but not yet shipped.)
+You should see:
 
-## First run (5 minutes)
-
-```sh
-# 1. Index a folder of notes
-dora index ~/path/to/your/notes
-
-# 2. Register it in the global registry
-dora source add ~/path/to/your/notes
-
-# 3. Patch Claude Code (+ Cursor + Codex) MCP configs + install shell wrappers
-dora install
-
-# 4. Verify everything's wired up
-dora doctor
+```
+dora 0.1.0
 ```
 
-Then restart Claude Code (or Cursor / Codex). It'll see a `mcp__dora__search` tool automatically.
+> **About the Gatekeeper line**: the binary isn't code-signed (signing requires a $99/yr Apple developer account I haven't paid for). The `xattr` line removes the quarantine flag macOS adds to downloads, so it'll launch without complaining. If you skip it, the first run shows *"cannot be opened because the developer cannot be verified"* — right-click in Finder → Open → "Open Anyway" gets past it.
 
-Try a query from the terminal:
+## Tutorial — your first search in 5 minutes
+
+This walks you through indexing a folder of notes, wiring it into Claude Code, and running your first query. Replace `~/notes` with your actual notes folder (Obsidian vault, dump of markdown files, etc.).
+
+### Step 1 — Index your notes
 
 ```sh
-cd ~/path/to/your/notes
-dora "what did I write about X?"
-# or, after `dora install`, with the grep wrapper:
-grep "what did I write about X?"
+dora index ~/notes
+```
+
+You should see something like:
+
+```
+indexed: 73 inserted, 0 updated, 0 touched, 0 renamed, 0 deleted, 0 unchanged in 14.81s [model: fastembed:Xenova/bge-small-en-v1.5]
+```
+
+What just happened: dora walked `~/notes`, chunked each `.md` file, embedded each chunk using a small local ML model (auto-downloads ~80 MB the first time, cached for next time), and stored the result in `~/notes/.dora/index.db`. The first run takes seconds-to-minutes depending on vault size. Subsequent runs are basically instant for unchanged files.
+
+### Step 2 — Register the folder so dora knows about it globally
+
+```sh
+dora source add ~/notes
+```
+
+You should see:
+
+```
+added: notes -> /Users/you/notes
+```
+
+Optional but recommended — describe what the folder contains. This is shown to Claude when it's picking which source to search:
+
+```sh
+dora source describe notes "Personal notes and journal entries"
 ```
 
 You can register more folders any time:
 
 ```sh
-dora index ~/work/notes
-dora source add ~/work/notes --name work \
-  --description "Work meeting notes + design docs"
+dora index ~/work-notes
+dora source add ~/work-notes --name work --description "Work meeting notes + design docs"
 
-dora index ~/code-snippets
-dora source add ~/code-snippets --name snippets
+dora index ~/Dev/myproject/docs
+dora source add ~/Dev/myproject/docs --name proj-docs
 
 dora source list
+```
+
+### Step 3 — Try a query from the terminal
+
+```sh
+cd ~/notes
+dora "what did I write about hooks?"
+```
+
+You should see ranked hits — each line is `path:line: snippet`:
+
+```
+x/Hooks matter more than content.md:1: The first line of any post does more work than the next ten...
+post/Houston you have a data problem.md:14: ...if your hook doesn't earn the second sentence, the rest...
+```
+
+This is *semantic* search — it matches by meaning, not just literal keywords.
+
+### Step 4 — Wire it into Claude Code (+ Cursor + Codex)
+
+```sh
+dora install
+```
+
+This:
+- Adds a `dora` MCP server entry to `~/.claude.json`, `~/.cursor/mcp.json`, and `~/.codex/config.toml` (skips any that aren't installed).
+- Adds zsh wrappers to `~/.zshrc` for `grep`, `rg`, `ag`, `find` (so e.g. `grep "natural query"` inside `~/notes` runs dora instead of literal grep).
+
+You should see something like:
+
+```
+MCP hosts:
+  Claude   patched (/Users/you/.claude.json)
+  Cursor   patched (/Users/you/.cursor/mcp.json)
+  Codex    not installed (/Users/you/.codex/config.toml)
+
+Shell wrappers:
+  grep   added to ~/.zshrc
+  rg     added to ~/.zshrc
+  ag     added to ~/.zshrc
+  find   added to ~/.zshrc
+  (`source ~/.zshrc` or open a new shell)
+```
+
+**Restart Claude Code** (and Cursor / Codex) so they pick up the new MCP server.
+
+### Step 5 — Verify everything's healthy
+
+```sh
+dora doctor
+```
+
+You should see all green ✓ checks. If anything is `⚠` or `✗`, the message tells you what to fix.
+
+### Step 6 — Use it from Claude Code
+
+In a fresh Claude Code session, ask Claude something that requires your notes:
+
+```
+> What did I decide about the embedder trait?
+```
+
+Claude will call `mcp__dora__search` automatically, pull the relevant passages from your notes, and quote them back. No more "I don't have access to your files." You can also ask "what sources does dora have?" — Claude calls `mcp__dora__list_sources` and tells you what's registered.
+
+### Bonus — semantic grep in your terminal
+
+After `dora install`, inside any registered folder:
+
+```sh
+cd ~/notes
+grep "natural language query"        # → semantic search via dora
+rg "system design decisions"          # → semantic search via dora
+ag "concurrent state"                 # → semantic search via dora
+
+# Flag forms always fall through to the real tool:
+grep -F "literal pattern"             # → real grep
+rg --files                            # → real ripgrep
+```
+
+If the underlying tool isn't installed (e.g., you don't have ripgrep), the wrapper is harmless — `command rg "$@"` just errors the same as if no wrapper existed.
+
+### Keeping things fresh
+
+dora's incremental indexing means re-running `dora index` is cheap. Queries also self-heal — if you've edited a file since the last index, the next query notices and quietly catches up before searching. So you don't *have* to do anything. But if you want results to be ready instantly without that mid-query refresh, run a watcher in the background:
+
+```sh
+dora watch          # foreground; Ctrl-C to stop
+# or
+nohup dora watch > /tmp/dora-watch.log 2>&1 &
 ```
 
 ## What's happening under the hood
