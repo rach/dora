@@ -322,36 +322,54 @@ fn standard_body(tool: &str) -> String {
     )
 }
 
-/// `find` needs a stricter heuristic — it's almost always invoked with flags or paths.
-/// We only intercept the *single quoted phrase* form: `find "rust lifetimes"`. Any other
-/// shape falls through to real find unchanged.
+/// `find` needs a stricter heuristic than grep — its primary use is filesystem traversal
+/// with structural predicates (`-name`, `-type`, `-newer`), not content search. Two intercept
+/// shapes only, both flagless:
+///   1. `find "natural phrase"` — single arg containing whitespace.
+///   2. `find <dir> "natural phrase"` — dir + whitespace-containing arg; the path-aware form
+///      that mirrors the `grep -r "phrase" <dir>` shape from v0.2.4.
+/// Anything else (flags, multiple paths, paths without a quoted phrase) → real find.
 fn find_body() -> String {
     let begin = marker_begin("find");
     let end = marker_end("find");
     format!(
         r#"{begin}
-# dora find wrapper — `find "natural phrase"` (exactly one arg containing whitespace, no flags)
-# inside a registered dora source routes to semantic search. Any other invocation shape
-# (with flags, with paths, with multiple args) → real find, unchanged. Disable with
-# `dora wrappers off`.
+# dora find wrapper — intercepts the natural-language shapes
+#   find "phrase"                 (PWD must be inside a dora source)
+#   find <dir> "phrase"           (dir must resolve into a dora source)
+# Both require no flags and the phrase arg to contain whitespace (single-word grep-shaped
+# queries belong in `grep`). Anything else → real find. Disable with `dora wrappers off`.
 find() {{
+    dora wrappers status -q 2>/dev/null || {{ command find "$@"; return; }}
+    local _dora_phrase="" _dora_path=""
     if [ "$#" -eq 1 ]; then
         case "$1" in
-            -*) ;;
-            *' '*)
-                dora wrappers status -q 2>/dev/null || {{ command find "$@"; return; }}
-                _dora_dir="$PWD"
-                while [ "$_dora_dir" != "/" ]; do
-                    if [ -f "$_dora_dir/.dora/index.db" ]; then
-                        dora "$1"
-                        return
-                    fi
-                    _dora_dir="$(dirname "$_dora_dir")"
-                done
-                ;;
+            -*) command find "$@"; return ;;
+            *' '*) _dora_phrase="$1"; _dora_path="$PWD" ;;
+            *)    command find "$@"; return ;;
         esac
+    elif [ "$#" -eq 2 ]; then
+        case "$1" in -*) command find "$@"; return ;; esac
+        case "$2" in -*) command find "$@"; return ;; esac
+        case "$2" in *' '*) ;; *) command find "$@"; return ;; esac
+        [ -d "$1" ] || {{ command find "$@"; return; }}
+        _dora_path="$1"
+        _dora_phrase="$2"
+    else
+        command find "$@"; return
     fi
-    command find "$@"
+    local _dora_abs _dora_dir _dora_found=""
+    _dora_abs="$(cd "$_dora_path" 2>/dev/null && pwd)" || {{ command find "$@"; return; }}
+    _dora_dir="$_dora_abs"
+    while [ "$_dora_dir" != "/" ]; do
+        if [ -f "$_dora_dir/.dora/index.db" ]; then
+            _dora_found="$_dora_dir"
+            break
+        fi
+        _dora_dir="$(dirname "$_dora_dir")"
+    done
+    [ -n "$_dora_found" ] || {{ command find "$@"; return; }}
+    ( cd "$_dora_found" && dora "$_dora_phrase" )
 }}
 {end}
 "#

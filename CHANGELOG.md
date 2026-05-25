@@ -4,6 +4,19 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] — 2026-05-25
+
+### Changed
+
+- `find` wrapper picks up the same path-aware shape grep/rg/ag got in v0.2.4.
+  Two intercept shapes now (both flagless, both require the phrase arg to
+  contain whitespace so single-token queries stay in `grep`):
+  - `find "natural phrase"` — PWD must resolve into a dora source.
+  - `find <dir> "natural phrase"` — `<dir>` must resolve into a dora source.
+  Anything else (flags like `-name`/`-type`/`-newer`, multiple paths,
+  unquoted phrases) falls through to real `find` unchanged.
+- Existing installs run `dora install` once to pick up the new template.
+
 ## [0.2.4] — 2026-05-25
 
 ### Changed
