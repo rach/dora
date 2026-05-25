@@ -8,6 +8,7 @@ mod mode;
 mod pagerank;
 mod registry;
 mod search;
+mod settings;
 mod store;
 mod vault;
 mod watch;
@@ -126,6 +127,28 @@ enum Command {
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
         exclude: Vec<String>,
     },
+    /// Enable / disable the zsh wrappers that route flagless `grep` (and rg/ag/find) into dora.
+    Wrappers {
+        #[command(subcommand)]
+        action: WrappersAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WrappersAction {
+    /// Turn the wrappers off — `grep` (etc.) become normal again. Wrappers stay installed
+    /// in `~/.zshrc`; they just pass through when this flag is set. Re-enable with
+    /// `dora wrappers on`.
+    Off,
+    /// Turn the wrappers back on (default state).
+    On,
+    /// Print whether dora's wrappers are currently routing or passing through. With `-q`,
+    /// no output is printed; exit code 0 means enabled, 1 means disabled. The wrapper
+    /// template in `~/.zshrc` uses the quiet form as its hot-path check.
+    Status {
+        #[arg(short, long)]
+        quiet: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -183,6 +206,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Doctor) => cmd_doctor(),
         Some(Command::Watch { include, exclude }) => cmd_watch(include, exclude),
+        Some(Command::Wrappers { action }) => cmd_wrappers(action),
         None => {
             let q = cli
                 .query
@@ -272,6 +296,53 @@ fn cmd_install(
     let report = install::run(&include, &exclude, target, do_shell, &wrap)?;
     print!("{}", install::render_report(&report));
     Ok(())
+}
+
+fn cmd_wrappers(action: WrappersAction) -> Result<()> {
+    use settings::Settings;
+    match action {
+        WrappersAction::On => {
+            let mut s = Settings::load()?;
+            s.wrappers.enabled = true;
+            s.save()?;
+            println!("dora wrappers: enabled");
+            Ok(())
+        }
+        WrappersAction::Off => {
+            let mut s = Settings::load()?;
+            s.wrappers.enabled = false;
+            s.save()?;
+            println!(
+                "dora wrappers: disabled — `grep`/`rg`/`ag`/`find` pass through to the real tool"
+            );
+            Ok(())
+        }
+        WrappersAction::Status { quiet } => {
+            let s = Settings::load()?;
+            if quiet {
+                if s.wrappers.enabled {
+                    std::process::exit(0);
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            let path = settings::settings_path()?;
+            let path_note = if path.exists() {
+                format!(" (config: {})", path.display())
+            } else {
+                String::new()
+            };
+            if s.wrappers.enabled {
+                println!("dora wrappers: enabled{}", path_note);
+            } else {
+                println!(
+                    "dora wrappers: disabled — `grep`/`rg`/`ag`/`find` pass through{}",
+                    path_note
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn cmd_watch(include: Vec<String>, exclude: Vec<String>) -> Result<()> {

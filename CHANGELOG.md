@@ -4,6 +4,27 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-05-25
+
+### Added
+
+- `dora wrappers <on|off|status>` subcommand toggles the shell wrappers
+  (`grep`/`rg`/`ag`/`find` injected by `dora install`) without editing
+  `.zshrc`. State persists in a new global config file
+  `~/.config/dora/config.toml` under `[wrappers] enabled`. Default: enabled.
+- `dora wrappers status -q` exits 0 if enabled, 1 if disabled — used by the
+  wrapper template itself as the hot-path check.
+- Doctor's `~/.zshrc` line now surfaces the active toggle state ("active" vs
+  "installed but disabled").
+
+### Changed
+
+- Wrapper template in `~/.zshrc` calls `dora wrappers status -q 2>/dev/null`
+  at the top of each function. If dora is missing/broken or the toggle's off,
+  the wrapper falls through to the real `grep`/`rg`/`ag`/`find`. Existing
+  installs need to run `dora install` once to pick up the new template
+  (idempotent rewrite of the dora-managed block).
+
 ## [0.2.2] — 2026-05-24
 
 ### Changed

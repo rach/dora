@@ -440,10 +440,22 @@ fn check_shell_wrapper(home: &Path) -> Vec<Check> {
             detail: "no dora wrappers installed — run `dora install`".to_string(),
         });
     } else {
+        // Also surface the live-toggle state from `~/.config/dora/config.toml`. Wrappers
+        // can be installed in `.zshrc` but flipped off via `dora wrappers off` — that's a
+        // distinct state from "not installed".
+        let toggle_state = match crate::settings::Settings::load() {
+            Ok(s) if s.wrappers.enabled => "active",
+            Ok(_) => "installed but disabled (run `dora wrappers on` to re-enable)",
+            Err(_) => "active",
+        };
         out.push(Check {
             status: CheckStatus::Ok,
             label: "~/.zshrc".into(),
-            detail: format!("dora wrappers: {}", installed.join(", ")),
+            detail: format!(
+                "dora wrappers: {} — {}",
+                installed.join(", "),
+                toggle_state
+            ),
         });
     }
     out

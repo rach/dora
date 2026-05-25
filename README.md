@@ -240,6 +240,16 @@ rg --files                            # → real ripgrep
 
 If the underlying tool isn't installed (e.g., you don't have ripgrep), the wrapper is harmless — `command rg "$@"` just errors the same as if no wrapper existed.
 
+**Turning the wrappers off temporarily.** If you want `grep` to behave like real grep again — for a debugging session, a script, or just permanently — flip the toggle:
+
+```sh
+dora wrappers off       # `grep`/`rg`/`ag`/`find` pass through to the real tool
+dora wrappers on        # back to routing flagless calls into dora
+dora wrappers status    # which mode is active
+```
+
+The state lives in `~/.config/dora/config.toml` and survives shells + reboots. No need to edit `.zshrc`. The wrappers stay installed; they just delegate when the toggle is off.
+
 ### Keeping things fresh
 
 dora's incremental indexing means re-running `dora index` is cheap. Queries also self-heal — if you've edited a file since the last index, the next query notices and quietly catches up before searching. So you don't *have* to do anything. If you want instant results without that mid-query refresh (and auto-pickup of newly-added sources), run `dora watch` — see [Step 5.5](#step-55--optional-run-a-background-watcher) above.
@@ -340,6 +350,7 @@ dora install [--client …] [--include …] [--wrap …]               # patch M
 dora doctor                                                      # health check, exit code reflects status
 dora mcp [--include …] [--exclude …] [--source <path>]           # run the MCP server (usually called by Claude Code itself)
 dora watch [--include …] [--exclude …]                           # foreground watcher that keeps things fresh proactively
+dora wrappers <on|off|status>                                    # toggle the grep/rg/ag/find shell wrappers without editing ~/.zshrc
 ```
 
 Every command has a `--help`. Full reference (with examples for each command, config file format, embedding-model choices, and Claude Code wiring details) is below.

@@ -264,8 +264,10 @@ fn standard_body(tool: &str) -> String {
     format!(
         r#"{begin}
 # dora {tool} wrapper — flagless `{tool}` inside a registered dora source routes to semantic
-# search. Any flag (-i, -F, etc.) or non-source cwd → real {tool}, unchanged.
+# search. Any flag (-i, -F, etc.) or non-source cwd → real {tool}, unchanged. Disable with
+# `dora wrappers off` (the `dora wrappers status -q` hot-path check exits non-zero then).
 {tool}() {{
+    dora wrappers status -q 2>/dev/null || {{ command {tool} "$@"; return; }}
     for arg in "$@"; do
         case "$arg" in -*) command {tool} "$@"; return ;;
         esac
@@ -295,12 +297,14 @@ fn find_body() -> String {
         r#"{begin}
 # dora find wrapper — `find "natural phrase"` (exactly one arg containing whitespace, no flags)
 # inside a registered dora source routes to semantic search. Any other invocation shape
-# (with flags, with paths, with multiple args) → real find, unchanged.
+# (with flags, with paths, with multiple args) → real find, unchanged. Disable with
+# `dora wrappers off`.
 find() {{
     if [ "$#" -eq 1 ]; then
         case "$1" in
             -*) ;;
             *' '*)
+                dora wrappers status -q 2>/dev/null || {{ command find "$@"; return; }}
                 _dora_dir="$PWD"
                 while [ "$_dora_dir" != "/" ]; do
                     if [ -f "$_dora_dir/.dora/index.db" ]; then
