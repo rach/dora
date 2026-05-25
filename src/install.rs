@@ -263,24 +263,59 @@ fn standard_body(tool: &str) -> String {
     let end = marker_end(tool);
     format!(
         r#"{begin}
-# dora {tool} wrapper — flagless `{tool}` inside a registered dora source routes to semantic
-# search. Any flag (-i, -F, etc.) or non-source cwd → real {tool}, unchanged. Disable with
-# `dora wrappers off` (the `dora wrappers status -q` hot-path check exits non-zero then).
+# dora {tool} wrapper — routes to dora's semantic search when the invocation is shaped like
+# "search this folder for this pattern". Specifically: allow `-r -R -i -n -H` (in any combo
+# like `-rin`); take the first non-flag arg as the pattern; treat any subsequent non-flag
+# args as paths (default: PWD). If every path is a directory that sits inside a folder with
+# `.dora/index.db`, route to `dora "$pattern"` from that source root. Anything else (other
+# flags, file paths, paths outside a dora source) falls through to the real {tool}. Disable
+# with `dora wrappers off`.
 {tool}() {{
     dora wrappers status -q 2>/dev/null || {{ command {tool} "$@"; return; }}
-    for arg in "$@"; do
-        case "$arg" in -*) command {tool} "$@"; return ;;
+    local _dora_pattern="" _dora_seen=0 _dora_arg _dora_flag _dora_ch
+    local -a _dora_paths
+    _dora_paths=()
+    for _dora_arg in "$@"; do
+        case "$_dora_arg" in
+            --) command {tool} "$@"; return ;;
+            -*)
+                _dora_flag="${{_dora_arg#-}}"
+                while [ -n "$_dora_flag" ]; do
+                    _dora_ch="${{_dora_flag%${{_dora_flag#?}}}}"
+                    case "$_dora_ch" in
+                        r|R|i|n|H) ;;
+                        *) command {tool} "$@"; return ;;
+                    esac
+                    _dora_flag="${{_dora_flag#?}}"
+                done ;;
+            *)
+                if [ "$_dora_seen" = 0 ]; then
+                    _dora_pattern="$_dora_arg"
+                    _dora_seen=1
+                else
+                    _dora_paths+=("$_dora_arg")
+                fi ;;
         esac
     done
-    _dora_dir="$PWD"
-    while [ "$_dora_dir" != "/" ]; do
-        if [ -f "$_dora_dir/.dora/index.db" ]; then
-            dora "$@"
-            return
-        fi
-        _dora_dir="$(dirname "$_dora_dir")"
+    [ "$_dora_seen" = 1 ] || {{ command {tool} "$@"; return; }}
+    [ ${{#_dora_paths[@]}} -eq 0 ] && _dora_paths=("$PWD")
+    local _dora_root="" _dora_p _dora_abs _dora_dir _dora_found
+    for _dora_p in "${{_dora_paths[@]}}"; do
+        [ -d "$_dora_p" ] || {{ command {tool} "$@"; return; }}
+        _dora_abs="$(cd "$_dora_p" 2>/dev/null && pwd)" || {{ command {tool} "$@"; return; }}
+        _dora_dir="$_dora_abs"
+        _dora_found=""
+        while [ "$_dora_dir" != "/" ]; do
+            if [ -f "$_dora_dir/.dora/index.db" ]; then
+                _dora_found="$_dora_dir"
+                break
+            fi
+            _dora_dir="$(dirname "$_dora_dir")"
+        done
+        [ -n "$_dora_found" ] || {{ command {tool} "$@"; return; }}
+        [ -z "$_dora_root" ] && _dora_root="$_dora_found"
     done
-    command {tool} "$@"
+    ( cd "$_dora_root" && dora "$_dora_pattern" )
 }}
 {end}
 "#

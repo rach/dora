@@ -4,6 +4,30 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-05-25
+
+### Changed
+
+- The shell wrapper for `grep` / `rg` / `ag` no longer falls through on
+  every flag. It now intercepts the common-search shape:
+  `grep -r "pattern" [path...]` (and any combination of `-r -R -i -n -H`
+  flags) — exactly the form people actually type. Behavior:
+  - Allowed flag chars: `r R i n H`. Any other flag → real grep.
+  - Pattern arg + optional directory path args. If no path given, PWD is
+    used. Each path is resolved to absolute and walked up looking for
+    `.dora/index.db`; if every path lands inside a registered dora
+    source, the wrapper cd's into the first source root in a subshell
+    and runs `dora "$pattern"`. Otherwise real grep.
+  - File paths (vs directories) fall through — the user clearly wants
+    real grep on a specific file.
+- Net effect: `grep -r "Reciprocal Rank Fusion" .` from inside a notes
+  vault now returns dora's semantic hits instead of running real grep
+  recursively. Same for `grep -r "..." ~/Dev/myproject` from anywhere.
+  `grep -E`, `grep -F`, `grep -v`, `grep -l`, etc. still fall through.
+- Existing installs need to run `dora install` once to pick up the new
+  wrapper template (the dora-managed block in `.zshrc` is rewritten
+  idempotently).
+
 ## [0.2.3] — 2026-05-25
 
 ### Added
