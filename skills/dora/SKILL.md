@@ -113,10 +113,18 @@ full file context, then `Edit`. Don't force every step through dora.
 
 ## Tool reference
 
-All six tools are exposed as `mcp__dora__<name>`:
+All seven tools are exposed as `mcp__dora__<name>`:
 
-- `search(query, source?, top_k=10, path_prefix?)` — hybrid FTS5 + vector ANN, merged via
-  Reciprocal Rank Fusion. Works in any mode. Omit `source` for cross-source search.
+- `search(query, source?, top_k=10, path_prefix?, min_score?, all?, output?)` — hybrid
+  FTS5 + vector + literal-substring, merged via RRF. Omit `source` for cross-source search.
+  v0.4 args:
+  - `min_score: number` — drop hits below this RRF threshold. Pair with `all: true` for
+    "every relevant doc above this confidence" flows.
+  - `all: true` — drop the top_k cap, return every hit that passed `min_score`.
+  - `output: "files"` — dedupe hits by path, one entry per file (no snippet/line). Pairs
+    with `all: true` to enumerate every matching file in the corpus.
+  Each hit may carry a `context` field — a user-attached description of the subtree the
+  path lives under (set via `dora context add`). Surface it in your reply when present.
 - `list_sources()` — every registered source with name, description, path, embedder id, file +
   chunk counts. Call this once at the start of a session if you don't know the source name.
 - `find_definition(symbol, source?, limit=10)` — definition chunks where `symbol == ?`. Code mode.
@@ -126,6 +134,10 @@ All six tools are exposed as `mcp__dora__<name>`:
   mode.
 - `repo_map(source, focus_paths=[], token_budget=2000)` — PageRank-ranked outline. **Requires**
   `source` (scores aren't comparable across separately-computed graphs). Code mode.
+- `multi_get(source, pattern, max_bytes?=102400)` — batch-retrieve documents by glob pattern
+  (e.g. `src/**/*.rs`, `notes/2026-*.md`) relative to the source root. Returns body text per
+  match; files larger than `max_bytes` are truncated and flagged. Use this instead of N×Read
+  when you already know which files you want.
 
 ## Quick troubleshooting
 

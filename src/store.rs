@@ -117,6 +117,7 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let s = Self { conn };
         s.create_schema(embed_dims)?;
+        crate::migrations::run(&s.conn)?;
         Ok(s)
     }
 
@@ -444,6 +445,98 @@ impl Store {
     /// access from outside the Store.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    // ---------- per-subpath context strings (v0.4) ----------
+
+    /// Upsert a context description anchored at `path_prefix`. Use `"/"` for a source-wide
+    /// default. Surfaced on each search hit whose path is under the prefix.
+    pub fn add_context(&self, path_prefix: &str, description: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO contexts (path_prefix, description, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(path_prefix) DO UPDATE SET \
+                 description = excluded.description, \
+                 updated_at  = excluded.updated_at",
+            params![path_prefix, description, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a context entry. Returns true iff a row was deleted.
+    pub fn remove_context(&self, path_prefix: &str) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM contexts WHERE path_prefix = ?", params![path_prefix])?;
+        Ok(affected > 0)
+    }
+
+    /// List every (path_prefix, description) pair, sorted by prefix.
+    pub fn list_contexts(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path_prefix, description FROM contexts ORDER BY path_prefix")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Return the deepest-matching context description for the given path, if any. Convention:
+    ///   * `path_prefix = "/"` — source-wide default; matches every path.
+    ///   * `path_prefix = "/api"` — matches any path whose first segment is `api/...` (we
+    ///     normalize the searched path with a leading `/` first, since chunk paths are
+    ///     stored relative to the source root without one).
+    /// Subtree match requires a `/` boundary so `/foo` doesn't accidentally match `/foobar`.
+    /// Longer prefix wins ties so a subtree context overrides the global one.
+    pub fn context_for(&self, path: &str) -> Result<Option<String>> {
+        // Cheap fast-path: skip the SELECT when no contexts are registered. Worth it because
+        // this runs once per Hit, and the typical source has zero contexts configured.
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM contexts", [], |r| r.get(0))?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let normalized = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT description FROM contexts \
+             WHERE path_prefix = '/' \
+                OR path_prefix = ? \
+                OR ? LIKE path_prefix || '/%' \
+             ORDER BY LENGTH(path_prefix) DESC LIMIT 1",
+        )?;
+        let result: rusqlite::Result<String> =
+            stmt.query_row(params![&normalized, &normalized], |r| r.get(0));
+        match result {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Enumerate every `files.path` that matches the glob pattern. Pattern semantics match
+    /// `globset` (e.g. `**/*.rs`, `src/chunk/*.rs`). Paths are returned in alphabetical order.
+    /// The body bytes are NOT read here — callers can decide whether they need each one.
+    pub fn list_paths_matching(&self, pattern: &str) -> Result<Vec<String>> {
+        let glob = globset::Glob::new(pattern)
+            .with_context(|| format!("invalid glob pattern: {pattern}"))?
+            .compile_matcher();
+        let mut stmt = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let p = r?;
+            if glob.is_match(&p) {
+                out.push(p);
+            }
+        }
+        Ok(out)
     }
 
     // ---------- code-aware lookups (sub-slice E) ----------
@@ -852,5 +945,109 @@ mod tests {
         assert_eq!(hits.len(), 1, "nested heading term must reach FTS");
         let hits = store.search_fts("\"lorem\"", 10, None).unwrap();
         assert_eq!(hits.len(), 1, "body terms still work");
+    }
+
+    #[test]
+    fn context_for_matches_subtree_and_global_with_boundary() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("c.db");
+        let store = Store::open(&db, 4).unwrap();
+
+        // No contexts yet → None for everything.
+        assert!(store.context_for("technology/x.md").unwrap().is_none());
+
+        // Add a subtree context.
+        store
+            .add_context("/technology", "Engineering nuggets")
+            .unwrap();
+        assert_eq!(
+            store.context_for("technology/Reciprocal.md").unwrap(),
+            Some("Engineering nuggets".to_string()),
+            "subtree path should match /technology prefix"
+        );
+        // Boundary safety: /technology must NOT match /technology2/...
+        assert!(
+            store.context_for("technology2/foo.md").unwrap().is_none(),
+            "subtree match must require / boundary"
+        );
+
+        // Add a deeper override + a global default. Deepest wins.
+        store
+            .add_context("/technology/rrf", "RRF-specific notes")
+            .unwrap();
+        store.add_context("/", "Personal vault").unwrap();
+        assert_eq!(
+            store
+                .context_for("technology/rrf/details.md")
+                .unwrap()
+                .unwrap(),
+            "RRF-specific notes"
+        );
+        assert_eq!(
+            store
+                .context_for("technology/other.md")
+                .unwrap()
+                .unwrap(),
+            "Engineering nuggets"
+        );
+        assert_eq!(
+            store.context_for("gtm/foo.md").unwrap().unwrap(),
+            "Personal vault"
+        );
+
+        // Removal works.
+        assert!(store.remove_context("/technology/rrf").unwrap());
+        assert_eq!(
+            store
+                .context_for("technology/rrf/details.md")
+                .unwrap()
+                .unwrap(),
+            "Engineering nuggets",
+            "after removing the deepest, the parent prefix takes over"
+        );
+    }
+
+    /// Migrations run once on first open, are recorded, and don't re-apply on subsequent
+    /// opens. Re-opening a DB created by a future binary (with extra migrations) must not
+    /// error — the loop just skips already-applied versions.
+    #[test]
+    fn migrations_apply_once_and_only_once() {
+        use crate::migrations::MIGRATIONS;
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("m.db");
+
+        let store = Store::open(&db, 4).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, MIGRATIONS.len() as i64);
+        let max_version: i64 = store
+            .conn
+            .query_row("SELECT MAX(version) FROM migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max_version, MIGRATIONS.last().unwrap().0);
+        drop(store);
+
+        // Re-open the same DB — should be a no-op.
+        let store2 = Store::open(&db, 4).unwrap();
+        let count2: i64 = store2
+            .conn
+            .query_row("SELECT COUNT(*) FROM migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count2, MIGRATIONS.len() as i64, "migrations must be idempotent");
+
+        // Confirm migration #1 created the contexts table.
+        let table_exists: i64 = store2
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contexts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1, "contexts table created by migration #1");
     }
 }

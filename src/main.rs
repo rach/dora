@@ -4,6 +4,7 @@ mod doctor;
 mod embed;
 mod install;
 mod mcp;
+mod migrations;
 mod mode;
 mod pagerank;
 mod registry;
@@ -50,6 +51,21 @@ struct Cli {
     /// Override the configured top_k for this call.
     #[arg(long, global = true)]
     top_k: Option<usize>,
+
+    /// Drop any hit whose merged RRF score is below this threshold. Combines with `--all`
+    /// for "give me every relevant doc above this confidence" agentic flows.
+    #[arg(long, global = true, value_name = "FLOAT")]
+    min_score: Option<f64>,
+
+    /// Disable the top_k cap and return every hit that passed `--min-score` (if set, else
+    /// every hit at all). Useful with `--files` to enumerate every matching file.
+    #[arg(long, global = true)]
+    all: bool,
+
+    /// Files-only output: dedupe hits by path, return path list. Each line is a path; no
+    /// `:line:` prefix, no snippet, no heading. Pairs well with `--all` / `--min-score`.
+    #[arg(long, global = true)]
+    files: bool,
 }
 
 #[derive(Subcommand)]
@@ -132,6 +148,28 @@ enum Command {
         #[command(subcommand)]
         action: WrappersAction,
     },
+    /// Per-subpath context strings — descriptive metadata surfaced alongside search hits.
+    /// Use `/` as the prefix for a source-wide default; subtree prefixes override the parent.
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Attach a context description to a path prefix within a registered source.
+    Add {
+        source: String,
+        /// Path prefix, e.g. `/api`, `/sdk/typescript`, or `/` for the whole source.
+        prefix: String,
+        /// Description text shown to agents on hits under this prefix.
+        text: String,
+    },
+    /// List every context registered for a source.
+    List { source: String },
+    /// Remove a context entry by prefix.
+    Remove { source: String, prefix: String },
 }
 
 #[derive(Subcommand)]
@@ -207,12 +245,13 @@ fn main() -> Result<()> {
         Some(Command::Doctor) => cmd_doctor(),
         Some(Command::Watch { include, exclude }) => cmd_watch(include, exclude),
         Some(Command::Wrappers { action }) => cmd_wrappers(action),
+        Some(Command::Context { action }) => cmd_context(action),
         None => {
             let q = cli
                 .query
                 .context("provide a query, or use `dora index <path>` first")?;
             let cwd = std::env::current_dir()?;
-            cmd_search(&cwd, &q, cli.top_k, cli.json)
+            cmd_search(&cwd, &q, cli.top_k, cli.json, cli.min_score, cli.all, cli.files)
         }
     }
 }
@@ -339,6 +378,59 @@ fn cmd_wrappers(action: WrappersAction) -> Result<()> {
                     "dora wrappers: disabled — `grep`/`rg`/`ag`/`find` pass through{}",
                     path_note
                 );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_context(action: ContextAction) -> Result<()> {
+    fn open_store_for_source(name: &str) -> Result<Store> {
+        let reg = registry::Registry::load().context("load registry")?;
+        let src = reg
+            .find_by_name(name)
+            .ok_or_else(|| anyhow::anyhow!("no registered source named '{name}'"))?;
+        let cfg = Config::load_or_default(&src.path).context("load config")?;
+        let embedder = embed::from_config(&cfg.embedder, &models_dir(&src.path))?;
+        let db = db_path(&src.path);
+        if !db.exists() {
+            bail!(
+                ".dora/index.db not found at {}. Run `dora index {}` first.",
+                src.path.display(),
+                src.path.display()
+            );
+        }
+        Store::open(&db, embedder.dims())
+    }
+
+    match action {
+        ContextAction::Add { source, prefix, text } => {
+            let store = open_store_for_source(&source)?;
+            store.add_context(&prefix, &text)?;
+            println!("context: {source} {prefix} → {text}");
+            Ok(())
+        }
+        ContextAction::List { source } => {
+            let store = open_store_for_source(&source)?;
+            let rows = store.list_contexts()?;
+            if rows.is_empty() {
+                println!("(no contexts registered for '{source}')");
+                return Ok(());
+            }
+            let prefix_w = rows.iter().map(|(p, _)| p.len()).max().unwrap_or(0).max(6);
+            println!("{:<width$}  DESCRIPTION", "PREFIX", width = prefix_w);
+            for (prefix, desc) in rows {
+                println!("{:<width$}  {desc}", prefix, width = prefix_w);
+            }
+            Ok(())
+        }
+        ContextAction::Remove { source, prefix } => {
+            let store = open_store_for_source(&source)?;
+            let removed = store.remove_context(&prefix)?;
+            if removed {
+                println!("context removed: {source} {prefix}");
+            } else {
+                bail!("no context found at prefix '{prefix}' in source '{source}'");
             }
             Ok(())
         }
@@ -550,7 +642,15 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
 
 // ---------------- search ----------------
 
-fn cmd_search(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool) -> Result<()> {
+fn cmd_search(
+    cwd: &Path,
+    query: &str,
+    top_k_override: Option<usize>,
+    json: bool,
+    min_score: Option<f64>,
+    all: bool,
+    files: bool,
+) -> Result<()> {
     let source_root = cwd.canonicalize()?;
     let db = db_path(&source_root);
     if !db.exists() {
@@ -575,6 +675,17 @@ fn cmd_search(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool
     });
 
     let top_k = top_k_override.unwrap_or(cfg.search.top_k);
+    let opts = search::SearchOptions {
+        top_k,
+        min_score,
+        all,
+        path_prefix: None,
+        output: if files {
+            search::OutputMode::Files
+        } else {
+            search::OutputMode::Chunks
+        },
+    };
     let hits = search_with_self_heal(
         &source_root,
         &source_name,
@@ -583,8 +694,7 @@ fn cmd_search(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool
         &chunker,
         embedder.as_ref(),
         query,
-        top_k,
-        None,
+        opts,
     )?;
 
     if json {
@@ -593,6 +703,13 @@ fn cmd_search(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool
     }
     if hits.is_empty() {
         eprintln!("no hits");
+        return Ok(());
+    }
+    if files {
+        // Files mode: one path per line, no decoration. Pairs cleanly with shell pipes.
+        for h in hits {
+            println!("{}", h.path);
+        }
         return Ok(());
     }
     for h in hits {
@@ -618,8 +735,7 @@ pub(crate) fn search_with_self_heal(
     chunker: &dyn Chunker,
     embedder: &dyn Embedder,
     query: &str,
-    top_k: usize,
-    path_prefix: Option<&str>,
+    opts: search::SearchOptions<'_>,
 ) -> Result<Vec<search::Hit>> {
     let last_walk: u64 = store
         .get_meta("last_walk_at")?
@@ -628,7 +744,7 @@ pub(crate) fn search_with_self_heal(
     if now_secs().saturating_sub(last_walk) >= WALK_DEBOUNCE_SECS {
         run_incremental_index(source_root, cfg, chunker, embedder, store, false)?;
     }
-    search::search(query, store, embedder, source_root, source_name, top_k, path_prefix)
+    search::search(query, store, embedder, source_root, source_name, opts)
 }
 
 // ---------------- incremental indexing core ----------------

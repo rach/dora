@@ -1,6 +1,6 @@
 [package]
 name = "dora-fs"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Personal semantic memory for notes and code — single Rust binary, tree-sitter code chunking, MCP-first."
 license = "MIT"
@@ -27,6 +27,7 @@ rmcp       = { version = "1.7", features = ["server", "transport-io"] }
 schemars   = "1"
 dirs       = "5"
 notify     = "6"
+globset    = "0.4"
 
 # Code chunking (v0.2). tree-sitter + per-language grammars. tree-sitter-tags reads each
 # grammar's queries/tags.scm to find definitions/references — we don't write those queries.

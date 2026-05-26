@@ -37,12 +37,24 @@ struct SearchArgs {
     /// and merges the results by score.
     #[serde(default)]
     source: Option<String>,
-    /// Maximum number of hits to return. Default 10, capped at 50.
+    /// Maximum number of hits to return. Default 10, capped at 50. Ignored when `all=true`.
     #[serde(default)]
     top_k: Option<u32>,
     /// Path-prefix filter applied within each searched source (e.g. "Daily/").
     #[serde(default)]
     path_prefix: Option<String>,
+    /// Drop hits whose RRF score is below this threshold. Combine with `all` for
+    /// "every relevant document above this confidence" flows.
+    #[serde(default)]
+    min_score: Option<f64>,
+    /// Disable the top_k cap and return every hit that passed `min_score` (if set, else
+    /// every hit). Useful with `output: "files"` to enumerate every matching file.
+    #[serde(default)]
+    all: Option<bool>,
+    /// Output mode. "chunks" (default) returns one hit per chunk with snippet + line.
+    /// "files" dedupes by path and returns one hit per file (line=0, no snippet).
+    #[serde(default)]
+    output: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -128,6 +140,34 @@ struct RepoMapResult {
     outline: String,
     file_count: usize,
     chunk_count: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MultiGetArgs {
+    /// Source name (from `list_sources`) to scope the glob against.
+    source: String,
+    /// Glob pattern relative to the source root, e.g. `src/**/*.rs`, `notes/2026-*.md`,
+    /// `docs/README.md`. Matches `files.path` exactly via the `globset` crate's semantics.
+    pattern: String,
+    /// Per-file byte cap. Files larger than this are truncated and flagged. Default 102400
+    /// (~25k tokens per file at 4 chars/token).
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiGetEntry {
+    path: String,
+    content: String,
+    byte_count: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiGetResult {
+    source: String,
+    pattern: String,
+    entries: Vec<MultiGetEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,8 +306,21 @@ impl ServerHandler for DoraServer {
             .with_input_schema::<RepoMapArgs>()
             .annotate(ToolAnnotations::new().read_only(true));
 
+            let multi_get = Tool::new(
+                "multi_get",
+                "Batch-retrieve documents by glob pattern relative to a registered source's \
+                 root (e.g. `src/**/*.rs`, `notes/2026-*.md`). Returns body text per match, \
+                 truncated at `max_bytes` (default 102400). Use this instead of N×Read when \
+                 you already know which files you want — saves round-trips for the agent.",
+                std::sync::Arc::new(serde_json::Map::new()),
+            )
+            .with_input_schema::<MultiGetArgs>()
+            .annotate(ToolAnnotations::new().read_only(true));
+
             Ok(ListToolsResult {
-                tools: vec![search, list, find_def, find_callers, find_impls, repo_map],
+                tools: vec![
+                    search, list, find_def, find_callers, find_impls, repo_map, multi_get,
+                ],
                 ..Default::default()
             })
         }
@@ -287,6 +340,7 @@ impl ServerHandler for DoraServer {
                 "find_callers" => handle_find_callers(&state, request).await,
                 "find_implementations" => handle_find_implementations(&state, request).await,
                 "repo_map" => handle_repo_map(&state, request).await,
+                "multi_get" => handle_multi_get(&state, request).await,
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool: {other}"),
                     None,
@@ -314,7 +368,23 @@ async fn handle_search(
         ));
     }
     let top_k = args.top_k.unwrap_or(10).clamp(1, 50) as usize;
-    let path_prefix = args.path_prefix.as_deref();
+    let output = match args.output.as_deref() {
+        Some("files") => crate::search::OutputMode::Files,
+        Some("chunks") | None => crate::search::OutputMode::Chunks,
+        Some(other) => {
+            return Err(ErrorData::invalid_params(
+                format!("invalid output mode {other:?} (expected 'chunks' or 'files')"),
+                None,
+            ));
+        }
+    };
+    let opts = crate::search::SearchOptions {
+        top_k,
+        min_score: args.min_score,
+        all: args.all.unwrap_or(false),
+        path_prefix: args.path_prefix.as_deref(),
+        output,
+    };
 
     let mut guard = state
         .lock()
@@ -331,10 +401,10 @@ async fn handle_search(
                 ));
             }
             let s = multi.sources.get_mut(&name).expect("checked above");
-            search_one(s, &args.query, top_k, path_prefix)
+            search_one(s, &args.query, opts.clone())
                 .map_err(|e| ErrorData::internal_error(format!("search failed: {e}"), None))?
         }
-        None => search_cross(multi, &args.query, top_k, path_prefix)
+        None => search_cross(multi, &args.query, opts.clone())
             .map_err(|e| ErrorData::internal_error(format!("cross-source search failed: {e}"), None))?,
     };
 
@@ -663,11 +733,70 @@ async fn handle_repo_map(
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
+async fn handle_multi_get(
+    state: &Arc<Mutex<MultiSourceState>>,
+    request: CallToolRequestParams,
+) -> Result<CallToolResult, ErrorData> {
+    let args: MultiGetArgs = parse_args(request)?;
+    let max_bytes = args.max_bytes.unwrap_or(102_400) as usize;
+
+    let guard = state
+        .lock()
+        .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
+    let s = guard.sources.get(&args.source).ok_or_else(|| {
+        ErrorData::invalid_params(
+            format!(
+                "unknown source '{}'. registered: {}",
+                args.source,
+                guard.order.join(", ")
+            ),
+            None,
+        )
+    })?;
+    let paths = s
+        .store
+        .list_paths_matching(&args.pattern)
+        .map_err(|e| ErrorData::internal_error(format!("glob lookup: {e}"), None))?;
+    let mut entries = Vec::with_capacity(paths.len());
+    for rel in paths {
+        let full = s.path.join(&rel);
+        let Ok(body) = std::fs::read_to_string(&full) else {
+            // Silently skip files that disappeared / aren't UTF-8 — partial result is more
+            // useful to the agent than failing the whole call.
+            continue;
+        };
+        let byte_count = body.len();
+        let (content, truncated) = if byte_count > max_bytes {
+            // Find a char boundary at or just below max_bytes so we don't slice a codepoint.
+            let mut cut = max_bytes;
+            while cut > 0 && !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            (body[..cut].to_string(), true)
+        } else {
+            (body, false)
+        };
+        entries.push(MultiGetEntry {
+            path: rel,
+            content,
+            byte_count,
+            truncated,
+        });
+    }
+    let result = MultiGetResult {
+        source: args.source,
+        pattern: args.pattern,
+        entries,
+    };
+    let json = serde_json::to_string(&result)
+        .map_err(|e| ErrorData::internal_error(format!("serialize: {e}"), None))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
 fn search_one(
     s: &mut SourceState,
     query: &str,
-    top_k: usize,
-    path_prefix: Option<&str>,
+    opts: crate::search::SearchOptions<'_>,
 ) -> Result<Vec<crate::search::Hit>> {
     crate::search_with_self_heal(
         &s.path,
@@ -677,24 +806,31 @@ fn search_one(
         &s.chunker,
         s.embedder.as_ref(),
         query,
-        top_k,
-        path_prefix,
+        opts,
     )
 }
 
-/// Cross-source: over-fetch per source (2× top_k), then re-sort the merged list. RRF scores
-/// are on the same scale (1/(60+rank)) so direct comparison is defensible.
+/// Cross-source: over-fetch per source (2× top_k when capped), then re-sort + apply the
+/// caller's `top_k` / `all` / `min_score` on the merged list. RRF scores are on the same
+/// scale (1/(60+rank)) so direct comparison is defensible.
 fn search_cross(
     multi: &mut MultiSourceState,
     query: &str,
-    top_k: usize,
-    path_prefix: Option<&str>,
+    opts: crate::search::SearchOptions<'_>,
 ) -> Result<Vec<crate::search::Hit>> {
-    let per_source_top = (top_k * 2).max(top_k);
+    // Per-source over-fetch only when we'd otherwise truncate. With `all`, fetch every hit.
+    let per_source_opts = if opts.all {
+        opts.clone()
+    } else {
+        crate::search::SearchOptions {
+            top_k: (opts.top_k * 2).max(opts.top_k),
+            ..opts.clone()
+        }
+    };
     let mut all: Vec<crate::search::Hit> = Vec::new();
     for name in multi.order.clone() {
         let s = multi.sources.get_mut(&name).expect("name in order");
-        match search_one(s, query, per_source_top, path_prefix) {
+        match search_one(s, query, per_source_opts.clone()) {
             Ok(hits) => all.extend(hits),
             Err(e) => {
                 // Don't fail the whole call because one source errored — log + continue.
@@ -703,7 +839,9 @@ fn search_cross(
         }
     }
     all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    all.truncate(top_k);
+    if !opts.all {
+        all.truncate(opts.top_k);
+    }
     Ok(all)
 }
 
@@ -884,6 +1022,21 @@ fn build_search_schema(source_summary: &str) -> serde_json::Map<String, serde_js
             "path_prefix": {
                 "type": "string",
                 "description": "Path-prefix filter applied within each searched source (e.g. \"Daily/\")."
+            },
+            "min_score": {
+                "type": "number",
+                "description": "Drop hits whose merged RRF score is below this threshold. Combine with `all: true` for 'every relevant doc above this confidence' agentic flows."
+            },
+            "all": {
+                "type": "boolean",
+                "default": false,
+                "description": "Disable the top_k cap and return every hit that passed min_score (if set). Useful with output=\"files\" to enumerate every matching file in the corpus."
+            },
+            "output": {
+                "type": "string",
+                "enum": ["chunks", "files"],
+                "default": "chunks",
+                "description": "Output mode. 'chunks' returns one hit per chunk with snippet + line. 'files' dedupes by path and returns one hit per file (line=0, no snippet) — pairs well with `all: true` for listing every matching file."
             }
         },
         "required": ["query"]

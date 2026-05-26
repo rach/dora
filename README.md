@@ -375,17 +375,59 @@ Auto-detects `mode=codex`, defaults the source name to `codex`. Each hit's `head
 
 ```
 dora index [<path>]                                              # build/update the index for <path> (defaults to cwd)
-dora "<query>" [--top-k N] [--json]                              # search the index in cwd
-dora source add <path> [--name N] [--description "…"] [--mode M] # register a folder; --mode obsidian|notes|docs|code|auto
+dora "<query>" [--top-k N] [--json] [--min-score F] [--all] [--files]
+                                                                 # search the index in cwd
+dora source add <path> [--name N] [--description "…"] [--mode M] # register a folder; --mode obsidian|notes|docs|code|auto|claude-code|codex
 dora source list                                                 # show registered folders
 dora source remove <name>                                        # unregister
 dora source describe <name> "…"                                  # update a folder's description
+dora context add <source> <prefix> "<text>"                      # attach a context description to a subpath; surfaced on every hit under it
+dora context list <source>                                       # show registered contexts
+dora context remove <source> <prefix>                            # drop a context entry
 dora install [--client …] [--include …] [--wrap …]               # patch MCP host configs + shell wrappers
 dora doctor                                                      # health check, exit code reflects status
 dora mcp [--include …] [--exclude …] [--source <path>]           # run the MCP server (usually called by Claude Code itself)
 dora watch [--include …] [--exclude …]                           # foreground watcher that keeps things fresh proactively
 dora wrappers <on|off|status>                                    # toggle the grep/rg/ag/find shell wrappers without editing ~/.zshrc
 ```
+
+### Output modes for agents
+
+Three flags compose to express common agentic-flow shapes — supported on both the CLI
+and the MCP `search` tool (as `min_score: number`, `all: bool`, `output: "files"|"chunks"`).
+
+- `--min-score 0.05` — drop hits below an RRF score threshold. Replaces hand-tuning `--top-k`.
+- `--all` — disable the top-K cap; return every hit that passed `--min-score`.
+- `--files` — dedupe by path; print one line per file (no `:line:`, no snippet).
+
+```sh
+# Every note that even loosely matches, by file:
+dora "design decisions" --all --min-score 0.04 --files
+
+# Same shape from an agent via MCP:
+mcp__dora__search({query: "design decisions", all: true, min_score: 0.04, output: "files"})
+```
+
+There's also a peer tool **`multi_get`** that batch-reads documents by glob:
+`mcp__dora__multi_get({source: "dora", pattern: "src/**/*.rs"})`. Use it instead of
+N×Read once you already know which files you want.
+
+### Per-subpath contexts
+
+Attach a description to a path prefix inside a source; it surfaces alongside every hit
+under that subtree, so agents see *"this lives in the API reference"* without having to
+guess from the path.
+
+```sh
+dora context add brain /technology "Engineering and design nuggets"
+dora context add brain /sources    "Quoted source material — verbatim, not my words"
+dora context list brain
+```
+
+Conventions:
+- `/` is the source-wide default.
+- Subtree prefixes (`/foo`) override the global one (longest-match wins).
+- Boundary-safe — `/foo` doesn't accidentally match `/foobar`.
 
 Every command has a `--help`. Full reference (with examples for each command, config file format, embedding-model choices, and Claude Code wiring details) is below.
 

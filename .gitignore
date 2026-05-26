@@ -4,3 +4,5 @@
 .claude/
 # local-only release recipe (see scripts/release.sh in this checkout)
 /scripts/release.sh
+# local-only roadmap + PRDs (planning notes, not part of the shipped repo)
+/docs/

@@ -4,6 +4,43 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-26
+
+### Added
+
+- **`--min-score <f>`** CLI flag + MCP `search` arg. Drops hits below an RRF score
+  threshold. Pair with `--all` for "every relevant document above this confidence"
+  agentic flows.
+- **`--all`** CLI flag + MCP `search` arg. Disables the top_k cap; returns every hit
+  that passed `min_score` (if set).
+- **`--files`** CLI flag + MCP `search` arg `output: "files"`. Dedupes hits by path,
+  returns one entry per file (no `:line:` prefix, no snippet). Pairs with `--all`
+  to enumerate every matching file. Pattern from qmd.
+- **`multi_get` MCP tool**. Batch-retrieve documents by glob pattern relative to a
+  registered source's root (`src/**/*.rs`, `notes/2026-*.md`). Returns body text
+  per match, truncated at `max_bytes` (default 102400). Saves agents from N×Read
+  round-trips when they already know which files they want.
+- **`dora context <add|list|remove>`** + per-subpath context strings. Descriptive
+  metadata attached to a path prefix within a source, surfaced as `Hit.context` on
+  every matching search result. Use `/` as the prefix for source-wide default;
+  subtree prefixes override the global one (longest-match wins with `/` boundary
+  safety, so `/foo` doesn't match `/foobar`). New `contexts` table introduced via
+  migration #1.
+- **Forward-only DB migrations** (`src/migrations.rs`). Each `.dora/index.db` gains
+  a `migrations(version, applied_at)` table; `Store::open` applies any new entries
+  from the `MIGRATIONS` const slice idempotently. Sledgehammer (`SCHEMA_VERSION`)
+  reserved for breaking changes that genuinely need re-embedding; additive changes
+  ship as migrations and don't burn embedder time. v0.4 adds migration #1 (contexts);
+  v0.5+ additive changes append from here.
+
+### Changed
+
+- **RRF merge gains a top-rank bonus** (+0.05 for rank-1 in any sub-arm, +0.02 for
+  ranks 2-3) matching qmd's published fusion. Sharpens precision at the top of
+  ranked results without affecting recall.
+- `search::search()` signature now takes a `SearchOptions` struct instead of
+  loose `top_k` + `path_prefix` args, so the new flags thread through cleanly.
+
 ## [0.3.1] — 2026-05-25
 
 ### Added
