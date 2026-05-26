@@ -407,9 +407,16 @@ fn cmd_source(action: SourceAction) -> Result<()> {
                 );
             }
             let final_name = name.unwrap_or_else(|| {
-                abs.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "source".to_string())
+                // For ~/.claude/projects/ the basename is "projects" — useless as a source
+                // name. When mode resolves to claude-code, default to "claude-code".
+                let resolved_mode = crate::mode::Mode::detect(&abs);
+                if resolved_mode == crate::mode::Mode::ClaudeCode {
+                    "claude-code".to_string()
+                } else {
+                    abs.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "source".to_string())
+                }
             });
             let mut reg = registry::Registry::load().context("load registry")?;
             reg.add(registry::Source {
@@ -519,8 +526,13 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
 
     let summary = run_incremental_index(&vault, &cfg, &chunker, embedder.as_ref(), &mut store, dry_run)?;
 
+    let settling_note = if summary.settling > 0 {
+        format!(", {} settling", summary.settling)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "{}: {} inserted, {} updated, {} touched, {} renamed, {} deleted, {} unchanged in {:.2?} [model: {}]",
+        "{}: {} inserted, {} updated, {} touched, {} renamed, {} deleted, {} unchanged{} in {:.2?} [model: {}]",
         if dry_run { "dry-run" } else { "indexed" },
         summary.inserted,
         summary.updated,
@@ -528,6 +540,7 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
         summary.renamed,
         summary.deleted,
         summary.skipped,
+        settling_note,
         started.elapsed(),
         embedder.id(),
     );
@@ -627,6 +640,8 @@ struct DiffSummary {
     renamed: usize,
     deleted: usize,
     skipped: usize,
+    /// Claude-code only: files filtered out by the settle window (active sessions).
+    settling: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -660,7 +675,23 @@ fn run_incremental_index(
     // from the resolved mode so code sources walk .rs/.py/.ts/etc., not just .md.
     let mode = crate::mode::Mode::parse(&cfg.source.mode).unwrap_or(crate::mode::Mode::Notes);
     let allow_exts = mode.extensions();
-    let entries = vault::list_entries(vault, &cfg.vault.ignore, allow_exts)?;
+    let mut entries = vault::list_entries(vault, &cfg.vault.ignore, allow_exts)?;
+
+    // For claude-code sources, filter out files whose mtime is too recent — those are
+    // active sessions being written to right now, and re-embedding every flush burns
+    // the embedder for no benefit. They'll be picked up on a subsequent index pass
+    // once they settle.
+    let mut summary_settling: usize = 0;
+    if mode == crate::mode::Mode::ClaudeCode {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cutoff = now_secs.saturating_sub(cfg.claude_code.settle_seconds);
+        let before = entries.len();
+        entries.retain(|e| e.mtime <= cutoff);
+        summary_settling = before - entries.len();
+    }
 
     // Phase 2: diff against existing files.
     let existing = store.list_files()?;
@@ -669,6 +700,7 @@ fn run_incremental_index(
     let mut to_update: Vec<(String, String, u64, u64, String)> = Vec::new();
     let mut to_touch: Vec<(String, u64)> = Vec::new();
     let mut summary = DiffSummary::default();
+    summary.settling = summary_settling;
 
     for entry in &entries {
         let rel = entry.relative_path.to_string_lossy().to_string();

@@ -11,12 +11,16 @@ use std::path::Path;
 use crate::config::{ChunkingConfig, EmbedderConfig, VaultConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Mode {
     Obsidian,
     Notes,
     Docs,
     Code,
+    /// Source-specific mode for indexing Claude Code session transcripts
+    /// (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`). Other agents (Codex, Aider, etc.)
+    /// would get their own mode if/when added — JSONL shapes differ per tool.
+    ClaudeCode,
     /// Resolved at indexing time by `Mode::detect`.
     Auto,
 }
@@ -36,6 +40,7 @@ impl Mode {
             "notes" => Some(Mode::Notes),
             "docs" => Some(Mode::Docs),
             "code" => Some(Mode::Code),
+            "claude-code" | "claude_code" => Some(Mode::ClaudeCode),
             "auto" | "" => Some(Mode::Auto),
             _ => None,
         }
@@ -47,6 +52,7 @@ impl Mode {
             Mode::Notes => "notes",
             Mode::Docs => "docs",
             Mode::Code => "code",
+            Mode::ClaudeCode => "claude-code",
             Mode::Auto => "auto",
         }
     }
@@ -65,10 +71,14 @@ impl Mode {
     }
 
     /// Auto-detect mode by inspecting the source directory. Order:
-    ///   1. `.obsidian/` present → `obsidian`
-    ///   2. Code-extension files outnumber `.md` ≥ 2:1 → `code`
-    ///   3. `.md` files outnumber code-extension files (or both zero) → `notes`
+    ///   1. Path ends with `.claude/projects` → `claude-code` (cheap path-shape check first)
+    ///   2. `.obsidian/` present → `obsidian`
+    ///   3. Code-extension files outnumber `.md` ≥ 2:1 → `code`
+    ///   4. `.md` files outnumber code-extension files (or both zero) → `notes`
     pub fn detect(source_root: &Path) -> Mode {
+        if is_claude_code_projects_dir(source_root) {
+            return Mode::ClaudeCode;
+        }
         if source_root.join(".obsidian").is_dir() {
             return Mode::Obsidian;
         }
@@ -109,6 +119,8 @@ impl Mode {
                 api_key_env: "OPENAI_API_KEY".into(),
                 dimensions: None,
             },
+            // ClaudeCode transcripts are prose (the user's natural-language prompts +
+            // assistant text), not code — use the prose embedder.
             _ => EmbedderConfig {
                 provider: "fastembed".into(),
                 model: "bge-small-en-v1.5".into(),
@@ -144,6 +156,10 @@ impl Mode {
                 ignore.push(".next".into());
                 ignore.push(".turbo".into());
             }
+            Mode::ClaudeCode => {
+                // ~/.claude/projects/ is a flat dir of <encoded-project>/*.jsonl folders.
+                // No subdirs to ignore beyond the global ones.
+            }
             Mode::Notes | Mode::Auto => {}
         }
         VaultConfig { ignore }
@@ -157,9 +173,20 @@ impl Mode {
             Mode::Obsidian | Mode::Notes => &["md"],
             Mode::Docs => &["md", "mdx", "rst"],
             Mode::Code => &["rs", "py", "pyi", "ts", "tsx", "js", "jsx", "go", "java", "rb"],
+            Mode::ClaudeCode => &["jsonl"],
             Mode::Auto => &["md"], // shouldn't be reached after resolve()
         }
     }
+}
+
+/// True if the path ends with `.claude/projects` (the canonical Claude Code session dir).
+fn is_claude_code_projects_dir(p: &Path) -> bool {
+    let components: Vec<_> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let n = components.len();
+    n >= 2 && components[n - 1] == "projects" && components[n - 2] == ".claude"
 }
 
 // ---------- detect-helpers ----------
@@ -206,6 +233,9 @@ fn count_extensions(root: &Path) -> DetectCounts {
 /// Human-friendly description of what `detect` saw — used by `dora source add` to print why
 /// a particular mode was chosen.
 pub fn detection_summary(source_root: &Path) -> String {
+    if is_claude_code_projects_dir(source_root) {
+        return "path ends with .claude/projects".to_string();
+    }
     if source_root.join(".obsidian").is_dir() {
         return "`.obsidian/` directory present".to_string();
     }

@@ -26,6 +26,7 @@ pub struct Config {
     pub chunking: ChunkingConfig,
     pub search: SearchConfig,
     pub embedder: EmbedderConfig,
+    pub claude_code: ClaudeCodeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,27 @@ pub struct ChunkingConfig {
 pub struct SearchConfig {
     pub top_k: usize,
     pub collapse_per_file: bool,
+}
+
+/// Settings specific to `mode = "claude-code"`. Used by `src/chunk/claude_code.rs`
+/// and by the active-session settle filter in `run_incremental_index`.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeConfig {
+    /// Include `thinking` blocks in the synthesized chunk text. Default false — they're often
+    /// huge internal-reasoning passages that bloat embeddings without improving retrieval.
+    pub include_thinking: bool,
+    /// Skip JSONL files whose mtime is newer than this many seconds. The active session is
+    /// being written constantly; re-embedding on every flush burns the embedder. Default 60s.
+    pub settle_seconds: u64,
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            include_thinking: false,
+            settle_seconds: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +108,7 @@ struct RawConfig {
     chunking: RawChunkingConfig,
     search: RawSearchConfig,
     embedder: RawEmbedderConfig,
+    claude_code: RawClaudeCodeConfig,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -125,6 +148,13 @@ struct RawEmbedderConfig {
     model: Option<String>,
     api_key_env: Option<String>,
     dimensions: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawClaudeCodeConfig {
+    include_thinking: Option<bool>,
+    settle_seconds: Option<u64>,
 }
 
 // ---------- loader ----------
@@ -183,6 +213,19 @@ impl Config {
                 model: raw.embedder.model.unwrap_or(embed_d.model),
                 api_key_env: raw.embedder.api_key_env.unwrap_or(embed_d.api_key_env),
                 dimensions: raw.embedder.dimensions.or(embed_d.dimensions),
+            },
+            claude_code: {
+                let d = ClaudeCodeConfig::default();
+                ClaudeCodeConfig {
+                    include_thinking: raw
+                        .claude_code
+                        .include_thinking
+                        .unwrap_or(d.include_thinking),
+                    settle_seconds: raw
+                        .claude_code
+                        .settle_seconds
+                        .unwrap_or(d.settle_seconds),
+                }
             },
         }
     }

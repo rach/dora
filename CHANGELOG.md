@@ -4,6 +4,59 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-25
+
+### Added
+
+- **`claude-code` mode**: index Claude Code session transcripts under
+  `~/.claude/projects/<encoded-cwd>/<session>.jsonl`. Each user-turn (one user
+  prompt plus the assistant text + tool calls until the next user prompt)
+  becomes one chunk, rendered as readable prose (`USER: …` / `ASSISTANT: …` /
+  `[tool: …]` / `[tool result: …]`). `heading_path` carries
+  `<project> · <iso-minute> · branch:<git-branch>` so search results are
+  project-anchored — no ugly `-Users-rachid-Dev-…` encoded paths surface.
+- Auto-detection: paths ending in `.claude/projects` resolve to `claude-code`
+  mode without needing `--mode`. `dora source add` defaults the source name
+  to `claude-code` in that case (the basename `"projects"` would be useless).
+- Settle filter: JSONL files whose mtime is newer than
+  `[claude_code] settle_seconds = 60` are skipped (they're being written to
+  by the active session; re-embedding every flush burns the embedder). Skipped
+  count appears in the index summary as `N settling`.
+- `[claude_code] include_thinking = false` (default): assistant `thinking`
+  blocks are excluded from chunk bodies — they bloat embeddings without
+  improving recall. Opt back in via the config field if you want them indexed.
+- One-liner setup: `dora source add ~/.claude/projects` (auto-detects + names
+  the source `claude-code`).
+
+### Notes
+
+- Other agent transcripts (Codex, Aider, Cursor) would get their own mode +
+  chunker — JSONL shapes differ per tool. The pattern is established by this
+  release.
+- No secret-redaction filter. Embedding vectors aren't reversible to
+  plaintext; the FTS5 + chunks tables store the same text already on disk in
+  `~/.claude/projects/`. If a use case for redaction emerges, that's a
+  separate v0.x feature.
+
+## [0.2.6] — 2026-05-25
+
+### Changed
+
+- FTS5 now indexes each chunk's `heading_path` alongside the body. The
+  markdown chunker strips heading lines from chunk content (the heading
+  is kept as metadata), which left the BM25 arm of RRF blind to queries
+  that match a section title verbatim — the embedding arm already saw
+  the heading via `chunk::embedded_text`, but FTS only saw the body.
+  This closes that gap.
+- Measured on `test-corpora/rust-book/src` against a 77-query set mined
+  from real H2/H3 headings (titles that don't appear verbatim in the
+  body, so heading signal is the only handle): R@1 0.571 → 0.740,
+  MRR 0.734 → 0.860, R@5 0.961 → 1.000. 21 queries improved, 0
+  regressed, 56 unchanged.
+- Existing installs need to reindex to pick up the change — old FTS
+  rows still contain body-only text. `rm -rf <source>/.dora/index.db &&
+  dora index <source>` on each registered source.
+
 ## [0.2.5] — 2026-05-25
 
 ### Changed

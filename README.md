@@ -288,6 +288,7 @@ A *mode* is a complete preset — chunker, embedder, file-extension filter, and 
 | `notes` | adaptive markdown | `bge-small-en-v1.5` | `.md` | `.md` files majority, no `.obsidian/` |
 | `docs` | adaptive markdown, smaller chunks | `bge-small-en-v1.5` | `.md`, `.mdx`, `.rst` | explicit only |
 | `code` | tree-sitter (6-language registry) | `jina-embeddings-v2-base-code` | `.rs`, `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.java`, `.rb` | code-extension majority |
+| `claude-code` | per-user-turn JSONL chunker (project + timestamp + branch as heading) | `bge-small-en-v1.5` | `.jsonl` | path ends with `.claude/projects` |
 | `auto` | resolved at index time | (resolved) | (resolved) | default — runs the rules above |
 
 ```sh
@@ -336,6 +337,29 @@ REGISTRY
   ✓ myproject    /Users/me/Dev/myproject, mode=code, embedder=fastembed:jinaai/jina-embeddings-v2-base-code,
                   function=412 method=288 class=156 module=47 interface=18, 9214 links
 ```
+
+## Indexing your Claude Code sessions
+
+dora can also index every Claude Code session you've ever had — the JSONL transcripts that live at `~/.claude/projects/<encoded-cwd>/<session>.jsonl`. Once indexed, "that session where I built X" or "what was the rg command we ran 40 turns ago" become semantic search queries.
+
+```sh
+dora index ~/.claude/projects
+dora source add ~/.claude/projects
+```
+
+Auto-detects to `mode=claude-code` and names the source `claude-code`. Each user-turn becomes one chunk (one user prompt + the assistant text + tool calls until the next user prompt); the `heading_path` is `<project> · <iso-minute> · branch:<git-branch>` so search results show *which* project a session came from (not the ugly encoded folder name).
+
+The active session (the one Claude Code is writing to *right now*) is skipped automatically — files whose mtime is within the last `[claude_code] settle_seconds = 60` window are excluded, so re-indexing while you're working doesn't burn the embedder. Reported as `N settling` in the index summary.
+
+`thinking` blocks are excluded by default. Flip on via:
+
+```toml
+[claude_code]
+include_thinking = true
+settle_seconds   = 60
+```
+
+Cross-source queries (notes + code + transcripts in one tool call) just work — `mcp__dora__search` returns merged hits across every registered source.
 
 ## Commands
 

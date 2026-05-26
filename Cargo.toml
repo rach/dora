@@ -1,6 +1,6 @@
 [package]
 name = "dora-fs"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 description = "Personal semantic memory for notes and code — single Rust binary, tree-sitter code chunking, MCP-first."
 license = "MIT"
@@ -39,6 +39,9 @@ tree-sitter-javascript = "0.23"
 tree-sitter-go         = "0.23"
 tree-sitter-java       = "0.23"
 tree-sitter-ruby       = "0.23"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

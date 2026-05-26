@@ -5,6 +5,7 @@
 //! we held for `Embedder`. Markdown sources continue to use [`markdown::MarkdownChunker`];
 //! code sources will use [`code::CodeChunker`] (sub-slice B).
 
+pub mod claude_code;
 pub mod code;
 pub mod markdown;
 
@@ -115,6 +116,7 @@ pub fn from_config(cfg: &Config, _source_root: &Path) -> Box<dyn Chunker> {
     let mode = Mode::parse(&cfg.source.mode).unwrap_or(Mode::Notes);
     match mode {
         Mode::Code => Box::new(code::CodeChunker::new(&cfg.chunking)),
+        Mode::ClaudeCode => Box::new(claude_code::ClaudeCodeChunker::new(&cfg.claude_code)),
         Mode::Obsidian | Mode::Notes | Mode::Docs | Mode::Auto => {
             Box::new(markdown::MarkdownChunker::from_config(&cfg.chunking))
         }

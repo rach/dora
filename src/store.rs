@@ -347,9 +347,19 @@ impl Store {
                 symbol_to_id.insert(sym, chunk_id);
             }
 
+            // Index the heading path alongside the body so BM25 sees the section title.
+            // The chunker strips the heading line from `content`, so without this the FTS
+            // arm of RRF is blind to queries that match section titles (e.g. "Setting Up
+            // a New Project" when the body never repeats those words verbatim). Measured
+            // on rust-book/src: R@1 0.57 → 0.74, MRR 0.73 → 0.86, 21 wins / 0 regressions.
+            let fts_text = if c.heading_path.is_empty() {
+                c.content.to_string()
+            } else {
+                format!("{}\n{}", c.heading_path, c.content)
+            };
             tx.execute(
                 "INSERT INTO chunks_fts (rowid, content) VALUES (?, ?)",
-                params![chunk_id, c.content],
+                params![chunk_id, fts_text],
             )?;
 
             let bytes = f32_vec_to_bytes(c.embedding);
@@ -802,4 +812,45 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// FTS must see `heading_path` so queries matching a section title still hit the chunk
+    /// even when the chunker stripped the heading line from the body. Regression for v0.2.6.
+    #[test]
+    fn fts_indexes_heading_path() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = Store::open(&db, 4).unwrap();
+
+        let emb = vec![0.0f32, 0.0, 0.0, 0.0];
+        // Body deliberately omits the unique heading words ("Quokka" / "Diplodocus") so
+        // the only way FTS can return this chunk for those terms is via the heading path.
+        let rows = vec![ChunkRow {
+            idx: 0,
+            heading_path: "Quokka > Diplodocus",
+            content: "lorem ipsum dolor sit amet",
+            start_byte: 0,
+            end_byte: 26,
+            embedding: &emb,
+            kind: "prose",
+            symbol: None,
+            parent_chunk_idx: None,
+        }];
+        store
+            .upsert_file_with_chunks("note.md", 1, 26, "hash", &rows, &[])
+            .unwrap();
+
+        let hits = store.search_fts("\"Quokka\"", 10, None).unwrap();
+        assert_eq!(hits.len(), 1, "heading-only term must reach FTS");
+        let hits = store.search_fts("\"Diplodocus\"", 10, None).unwrap();
+        assert_eq!(hits.len(), 1, "nested heading term must reach FTS");
+        let hits = store.search_fts("\"lorem\"", 10, None).unwrap();
+        assert_eq!(hits.len(), 1, "body terms still work");
+    }
 }

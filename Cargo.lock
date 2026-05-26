@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "dora-fs"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -705,6 +705,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlite-vec",
+ "tempfile",
  "tokio",
  "toml",
  "tree-sitter",

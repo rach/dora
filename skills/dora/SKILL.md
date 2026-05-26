@@ -1,14 +1,18 @@
 ---
 name: dora
 description: >
-  Help the user navigate, search, and reason about code repos AND notes/vault folders that are
-  registered with dora (https://github.com/rach/dora). Replaces grep-then-read loops with direct
-  calls to dora's MCP tools (search, find_definition, find_callers, find_implementations,
-  repo_map, list_sources). Use when the user asks where a symbol is defined, who calls a function,
-  what implements a trait/interface, asks for an overview or outline of a codebase, or asks any
-  "how does this work / where does X happen" question in a code repo. ALSO use when the user asks
-  "what did I write about X", "do I have anything on Y", or any retrieval question against
-  personal notes, journal entries, design docs, or an Obsidian vault. Activates whenever the
+  Help the user navigate, search, and reason about code repos, notes/vault folders, AND past
+  Claude Code session transcripts that are registered with dora
+  (https://github.com/rach/dora). Replaces grep-then-read loops with direct calls to dora's MCP
+  tools (search, find_definition, find_callers, find_implementations, repo_map, list_sources).
+  Use when the user asks where a symbol is defined, who calls a function, what implements a
+  trait/interface, asks for an overview or outline of a codebase, or asks any "how does this
+  work / where does X happen" question in a code repo. ALSO use when the user asks "what did I
+  write about X", "do I have anything on Y", or any retrieval question against personal notes,
+  journal entries, design docs, or an Obsidian vault. ALSO use when the user references a past
+  Claude Code conversation — "that session where we built X", "what did we work on yesterday",
+  "what was the rg command we ran 40 turns ago", "have I solved this kind of bug before" — and
+  the user has indexed `~/.claude/projects/` as a `claude-code` source. Activates whenever the
   current folder contains .dora/index.db or is registered via `dora source list`.
 ---
 
@@ -21,16 +25,20 @@ what *mode* the source is in.
 
 ## Step 1 — detect the source mode
 
-Before answering, find out whether you're working in a **code** source or a **notes** source.
-This decides the rest of the playbook.
+Before answering, find out which source(s) the question is about: a **code** source, a **notes**
+source, or **claude-code** (past Claude Code session transcripts). This decides the rest of the
+playbook.
 
 Options, in order of cost:
 
-1. Read `.dora/config.toml` in the current folder. Look for `[source] mode = "..."`.
-2. Call `mcp__dora__list_sources()` and find the entry whose `path` matches the current folder.
+1. For questions clearly about past Claude Code sessions ("what did we work on", "that session
+   where", "the rg command from earlier"): scope to the `claude-code` source directly via
+   `mcp__dora__search({query, source: "claude-code"})`. Skip the cwd-mode check.
+2. Otherwise, read `.dora/config.toml` in the current folder. Look for `[source] mode = "..."`.
+3. Call `mcp__dora__list_sources()` and find the entry whose `path` matches the current folder.
    The response includes the embedder id — `jinaai/jina-embeddings-v2-base-code` means code mode,
-   `Xenova/bge-small-en-v1.5` means notes/obsidian/docs mode.
-3. Run `dora source list` in the shell and check the output.
+   `Xenova/bge-small-en-v1.5` means notes/obsidian/docs/claude-code mode.
+4. Run `dora source list` in the shell and check the output.
 
 If no `.dora/index.db` exists in the folder and the path isn't registered, **dora isn't set up
 for this folder**. Tell the user and fall back to grep/Glob/Read. Don't pretend dora is available.
@@ -49,6 +57,24 @@ Pick the tool by question shape:
 
 Always pass `source` (the registered source name) so dora knows which index to hit. If you don't
 know the name, call `mcp__dora__list_sources()` once at the start.
+
+## Step 2.5 — claude-code playbook (`mode = claude-code`)
+
+When the user asks about a past Claude Code conversation:
+
+- `mcp__dora__search({query: "...", source: "claude-code"})` — semantic match across every
+  indexed session. Each hit's `heading_path` shows the project + ISO-minute timestamp + git
+  branch (e.g. `dora · 2026-05-24 18:50 · branch:main`), so you can ground answers in *when*
+  and *which project* an exchange happened.
+- For "what was the command we ran X turns ago" within the *current* session: the active
+  session is intentionally not indexed (the chunker skips files newer than ~60s). Fall back to
+  scanning the current conversation context. dora is for *past* sessions.
+- For multi-day recall ("we worked on this last week"): search by topic phrase, then read the
+  top hit's content for the actual exchange. Don't paraphrase — the hits contain the literal
+  user prompts and assistant responses.
+- For project-scoped queries ("did we ever discuss X in the brain project specifically"): use
+  the topic in the query and rely on `heading_path` filtering at result-render time, since
+  `path_prefix` operates on file paths (the encoded `-Users-…` form), not project names.
 
 ## Step 3 — notes playbook (`mode = obsidian` / `notes` / `docs`)
 
