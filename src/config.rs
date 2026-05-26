@@ -27,6 +27,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub embedder: EmbedderConfig,
     pub claude_code: ClaudeCodeConfig,
+    pub codex: CodexConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,27 @@ impl Default for ClaudeCodeConfig {
     }
 }
 
+/// Settings specific to `mode = "codex"`. Mirror of `ClaudeCodeConfig` — the two share the
+/// settle-window pattern but the analog of `thinking` blocks is called `reasoning` in Codex
+/// transcripts, hence the separate field name.
+#[derive(Debug, Clone)]
+pub struct CodexConfig {
+    /// Include `reasoning` blocks in the synthesized chunk text. Default false — same
+    /// rationale as `[claude_code] include_thinking`.
+    pub include_reasoning: bool,
+    /// Skip session JSONL files whose mtime is newer than this many seconds. Default 60s.
+    pub settle_seconds: u64,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            include_reasoning: false,
+            settle_seconds: 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbedderConfig {
     /// `"fastembed"` (default) or `"openai"`.
@@ -109,6 +131,7 @@ struct RawConfig {
     search: RawSearchConfig,
     embedder: RawEmbedderConfig,
     claude_code: RawClaudeCodeConfig,
+    codex: RawCodexConfig,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -154,6 +177,13 @@ struct RawEmbedderConfig {
 #[serde(default, deny_unknown_fields)]
 struct RawClaudeCodeConfig {
     include_thinking: Option<bool>,
+    settle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawCodexConfig {
+    include_reasoning: Option<bool>,
     settle_seconds: Option<u64>,
 }
 
@@ -225,6 +255,16 @@ impl Config {
                         .claude_code
                         .settle_seconds
                         .unwrap_or(d.settle_seconds),
+                }
+            },
+            codex: {
+                let d = CodexConfig::default();
+                CodexConfig {
+                    include_reasoning: raw
+                        .codex
+                        .include_reasoning
+                        .unwrap_or(d.include_reasoning),
+                    settle_seconds: raw.codex.settle_seconds.unwrap_or(d.settle_seconds),
                 }
             },
         }

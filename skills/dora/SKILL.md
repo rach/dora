@@ -12,8 +12,10 @@ description: >
   journal entries, design docs, or an Obsidian vault. ALSO use when the user references a past
   Claude Code conversation — "that session where we built X", "what did we work on yesterday",
   "what was the rg command we ran 40 turns ago", "have I solved this kind of bug before" — and
-  the user has indexed `~/.claude/projects/` as a `claude-code` source. Activates whenever the
-  current folder contains .dora/index.db or is registered via `dora source list`.
+  the user has indexed `~/.claude/projects/` as a `claude-code` source. The same applies to
+  past OpenAI Codex CLI conversations indexed via the `codex` mode (source name `codex`,
+  pointing at `~/.codex/sessions/`). Activates whenever the current folder contains
+  .dora/index.db or is registered via `dora source list`.
 ---
 
 # dora — semantic + structural search for code and notes
@@ -58,23 +60,27 @@ Pick the tool by question shape:
 Always pass `source` (the registered source name) so dora knows which index to hit. If you don't
 know the name, call `mcp__dora__list_sources()` once at the start.
 
-## Step 2.5 — claude-code playbook (`mode = claude-code`)
+## Step 2.5 — transcript playbook (`mode = claude-code` or `codex`)
 
-When the user asks about a past Claude Code conversation:
+When the user asks about a past Claude Code OR Codex CLI conversation:
 
 - `mcp__dora__search({query: "...", source: "claude-code"})` — semantic match across every
-  indexed session. Each hit's `heading_path` shows the project + ISO-minute timestamp + git
-  branch (e.g. `dora · 2026-05-24 18:50 · branch:main`), so you can ground answers in *when*
-  and *which project* an exchange happened.
+  indexed Claude Code session. Each hit's `heading_path` is
+  `<project> · <iso-minute> · branch:<branch>`.
+- `mcp__dora__search({query: "...", source: "codex"})` — same shape for Codex CLI sessions.
+  Hits' `heading_path` ends with `· codex` so they're easy to distinguish in mixed results.
+- `mcp__dora__search({query: "..."})` (no `source`) — cross-source merge: claude-code +
+  codex + notes + code all in one ranked list.
 - For "what was the command we ran X turns ago" within the *current* session: the active
-  session is intentionally not indexed (the chunker skips files newer than ~60s). Fall back to
-  scanning the current conversation context. dora is for *past* sessions.
+  session is intentionally not indexed (the chunker skips files newer than ~60s). Fall back
+  to scanning the current conversation context. dora is for *past* sessions.
 - For multi-day recall ("we worked on this last week"): search by topic phrase, then read the
   top hit's content for the actual exchange. Don't paraphrase — the hits contain the literal
   user prompts and assistant responses.
 - For project-scoped queries ("did we ever discuss X in the brain project specifically"): use
   the topic in the query and rely on `heading_path` filtering at result-render time, since
-  `path_prefix` operates on file paths (the encoded `-Users-…` form), not project names.
+  `path_prefix` operates on file paths (the encoded `-Users-…` form for claude-code, or the
+  `YYYY/MM/DD/rollout-…` form for codex), not project names.
 
 ## Step 3 — notes playbook (`mode = obsidian` / `notes` / `docs`)
 

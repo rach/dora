@@ -21,6 +21,10 @@ pub enum Mode {
     /// (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`). Other agents (Codex, Aider, etc.)
     /// would get their own mode if/when added — JSONL shapes differ per tool.
     ClaudeCode,
+    /// Source-specific mode for indexing OpenAI Codex CLI session transcripts
+    /// (`~/.codex/sessions/YYYY/MM/DD/rollout-<iso>-<uuid>.jsonl`). Envelope shape +
+    /// function_call/output records differ from claude-code, hence a peer mode.
+    Codex,
     /// Resolved at indexing time by `Mode::detect`.
     Auto,
 }
@@ -41,6 +45,7 @@ impl Mode {
             "docs" => Some(Mode::Docs),
             "code" => Some(Mode::Code),
             "claude-code" | "claude_code" => Some(Mode::ClaudeCode),
+            "codex" => Some(Mode::Codex),
             "auto" | "" => Some(Mode::Auto),
             _ => None,
         }
@@ -53,6 +58,7 @@ impl Mode {
             Mode::Docs => "docs",
             Mode::Code => "code",
             Mode::ClaudeCode => "claude-code",
+            Mode::Codex => "codex",
             Mode::Auto => "auto",
         }
     }
@@ -78,6 +84,9 @@ impl Mode {
     pub fn detect(source_root: &Path) -> Mode {
         if is_claude_code_projects_dir(source_root) {
             return Mode::ClaudeCode;
+        }
+        if is_codex_sessions_dir(source_root) {
+            return Mode::Codex;
         }
         if source_root.join(".obsidian").is_dir() {
             return Mode::Obsidian;
@@ -160,6 +169,9 @@ impl Mode {
                 // ~/.claude/projects/ is a flat dir of <encoded-project>/*.jsonl folders.
                 // No subdirs to ignore beyond the global ones.
             }
+            Mode::Codex => {
+                // ~/.codex/sessions/ is date-partitioned (YYYY/MM/DD). Nothing extra to ignore.
+            }
             Mode::Notes | Mode::Auto => {}
         }
         VaultConfig { ignore }
@@ -173,8 +185,26 @@ impl Mode {
             Mode::Obsidian | Mode::Notes => &["md"],
             Mode::Docs => &["md", "mdx", "rst"],
             Mode::Code => &["rs", "py", "pyi", "ts", "tsx", "js", "jsx", "go", "java", "rb"],
-            Mode::ClaudeCode => &["jsonl"],
+            Mode::ClaudeCode | Mode::Codex => &["jsonl"],
             Mode::Auto => &["md"], // shouldn't be reached after resolve()
+        }
+    }
+
+    /// True if this mode indexes an agent-transcript source (Claude Code, Codex, future).
+    /// Callers (the indexer's settle filter, doctor reporting) use it to apply transcript-
+    /// specific behavior uniformly without enumerating every variant.
+    pub fn is_transcript(&self) -> bool {
+        matches!(self, Mode::ClaudeCode | Mode::Codex)
+    }
+
+    /// How long a transcript file must have been at-rest before we index it. Active sessions
+    /// (the JSONL the agent is currently writing) are skipped. Non-transcript modes return 0
+    /// (the filter is a no-op for them).
+    pub fn settle_seconds(&self, cfg: &crate::config::Config) -> u64 {
+        match self {
+            Mode::ClaudeCode => cfg.claude_code.settle_seconds,
+            Mode::Codex => cfg.codex.settle_seconds,
+            _ => 0,
         }
     }
 }
@@ -187,6 +217,16 @@ fn is_claude_code_projects_dir(p: &Path) -> bool {
         .collect();
     let n = components.len();
     n >= 2 && components[n - 1] == "projects" && components[n - 2] == ".claude"
+}
+
+/// True if the path ends with `.codex/sessions` (the canonical Codex CLI session dir).
+fn is_codex_sessions_dir(p: &Path) -> bool {
+    let components: Vec<_> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let n = components.len();
+    n >= 2 && components[n - 1] == "sessions" && components[n - 2] == ".codex"
 }
 
 // ---------- detect-helpers ----------
@@ -235,6 +275,9 @@ fn count_extensions(root: &Path) -> DetectCounts {
 pub fn detection_summary(source_root: &Path) -> String {
     if is_claude_code_projects_dir(source_root) {
         return "path ends with .claude/projects".to_string();
+    }
+    if is_codex_sessions_dir(source_root) {
+        return "path ends with .codex/sessions".to_string();
     }
     if source_root.join(".obsidian").is_dir() {
         return "`.obsidian/` directory present".to_string();

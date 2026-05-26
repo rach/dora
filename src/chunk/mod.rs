@@ -7,6 +7,7 @@
 
 pub mod claude_code;
 pub mod code;
+pub mod codex;
 pub mod markdown;
 
 use std::path::Path;
@@ -117,6 +118,7 @@ pub fn from_config(cfg: &Config, _source_root: &Path) -> Box<dyn Chunker> {
     match mode {
         Mode::Code => Box::new(code::CodeChunker::new(&cfg.chunking)),
         Mode::ClaudeCode => Box::new(claude_code::ClaudeCodeChunker::new(&cfg.claude_code)),
+        Mode::Codex => Box::new(codex::CodexChunker::new(&cfg.codex)),
         Mode::Obsidian | Mode::Notes | Mode::Docs | Mode::Auto => {
             Box::new(markdown::MarkdownChunker::from_config(&cfg.chunking))
         }

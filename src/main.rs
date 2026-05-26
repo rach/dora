@@ -407,15 +407,16 @@ fn cmd_source(action: SourceAction) -> Result<()> {
                 );
             }
             let final_name = name.unwrap_or_else(|| {
-                // For ~/.claude/projects/ the basename is "projects" — useless as a source
-                // name. When mode resolves to claude-code, default to "claude-code".
+                // Transcript-mode source roots have generic basenames (`projects`,
+                // `sessions`) — use the mode name as a friendlier default.
                 let resolved_mode = crate::mode::Mode::detect(&abs);
-                if resolved_mode == crate::mode::Mode::ClaudeCode {
-                    "claude-code".to_string()
-                } else {
-                    abs.file_name()
+                match resolved_mode {
+                    crate::mode::Mode::ClaudeCode => "claude-code".to_string(),
+                    crate::mode::Mode::Codex => "codex".to_string(),
+                    _ => abs
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "source".to_string())
+                        .unwrap_or_else(|| "source".to_string()),
                 }
             });
             let mut reg = registry::Registry::load().context("load registry")?;
@@ -682,12 +683,12 @@ fn run_incremental_index(
     // the embedder for no benefit. They'll be picked up on a subsequent index pass
     // once they settle.
     let mut summary_settling: usize = 0;
-    if mode == crate::mode::Mode::ClaudeCode {
+    if mode.is_transcript() {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let cutoff = now_secs.saturating_sub(cfg.claude_code.settle_seconds);
+        let cutoff = now_secs.saturating_sub(mode.settle_seconds(cfg));
         let before = entries.len();
         entries.retain(|e| e.mtime <= cutoff);
         summary_settling = before - entries.len();

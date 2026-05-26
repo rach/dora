@@ -4,6 +4,39 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-25
+
+### Added
+
+- **`codex` mode**: index OpenAI Codex CLI session transcripts under
+  `~/.codex/sessions/YYYY/MM/DD/rollout-<iso>-<uuid>.jsonl`. Peer to
+  `claude-code` — separate mode because Codex's JSONL schema differs
+  (envelope `{timestamp, type, payload}`, split `function_call` /
+  `function_call_output` records linked by `call_id`, `reasoning` blocks).
+- Per-user-turn chunking matches the claude-code shape: one chunk = one user
+  prompt + every assistant text / tool call / tool result until the next
+  user prompt. Rendered as readable prose
+  (`USER: …` / `ASSISTANT: …` / `[tool: exec_command ls -la]` /
+  `[tool result exec_command: total 808 …]`).
+- `heading_path = "<project> · <iso-minute> · codex"` — the trailing `codex`
+  tag distinguishes Codex hits from Claude Code hits (`· branch:<branch>`)
+  in cross-source search results.
+- Auto-detection: paths ending in `.codex/sessions` resolve to `Mode::Codex`
+  without needing `--mode`. `dora source add ~/.codex/sessions` defaults
+  the source name to `codex`.
+- `[codex] include_reasoning = false` (default, mirrors
+  `[claude_code] include_thinking`); `settle_seconds = 60`.
+- Codex `function_call_output` strips the standard
+  `Chunk ID: … \nWall time: … \nProcess exited … \nOutput:\n` metadata
+  header so the indexed text is just the real tool output.
+
+### Changed
+
+- Generalized the active-session settle filter in `run_incremental_index`
+  from `mode == ClaudeCode` to `mode.is_transcript()`, which now covers both
+  `Mode::ClaudeCode` and `Mode::Codex` (and any future agent transcript modes
+  added to that helper). Same default-source-name pattern extended too.
+
 ## [0.3.0] — 2026-05-25
 
 ### Added

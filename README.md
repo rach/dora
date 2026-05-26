@@ -289,6 +289,7 @@ A *mode* is a complete preset — chunker, embedder, file-extension filter, and 
 | `docs` | adaptive markdown, smaller chunks | `bge-small-en-v1.5` | `.md`, `.mdx`, `.rst` | explicit only |
 | `code` | tree-sitter (6-language registry) | `jina-embeddings-v2-base-code` | `.rs`, `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.java`, `.rb` | code-extension majority |
 | `claude-code` | per-user-turn JSONL chunker (project + timestamp + branch as heading) | `bge-small-en-v1.5` | `.jsonl` | path ends with `.claude/projects` |
+| `codex` | per-user-turn JSONL chunker for OpenAI Codex CLI transcripts | `bge-small-en-v1.5` | `.jsonl` | path ends with `.codex/sessions` |
 | `auto` | resolved at index time | (resolved) | (resolved) | default — runs the rules above |
 
 ```sh
@@ -360,6 +361,15 @@ settle_seconds   = 60
 ```
 
 Cross-source queries (notes + code + transcripts in one tool call) just work — `mcp__dora__search` returns merged hits across every registered source.
+
+**Codex CLI transcripts** follow the same pattern via the `codex` mode:
+
+```sh
+dora index ~/.codex/sessions
+dora source add ~/.codex/sessions
+```
+
+Auto-detects `mode=codex`, defaults the source name to `codex`. Each hit's `heading_path` ends with `· codex` (vs `· branch:<branch>` for claude-code), so mixed cross-source search results stay distinguishable. `reasoning` blocks (Codex's analog of `thinking`) are skipped by default; opt back in via `[codex] include_reasoning = true`. Codex `function_call_output` text gets its standard `Chunk ID: … / Wall time: … / Output:\n` metadata header stripped so the indexed prose is just the real tool output.
 
 ## Commands
 
