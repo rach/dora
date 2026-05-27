@@ -4,6 +4,63 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-05-27
+
+### Changed
+
+- **Default embedder swapped from `bge-small-en-v1.5` to
+  `bge-base-en-v1.5-onnx-q`** (Qdrant's int8-quantized BGE-base). On the
+  maintainer's 53-query eval fixture: R@1 lifts from **0.868 → 0.943**
+  (+7.5 pts), MRR from **0.928 → 0.965**, and hard-paraphrase queries hit a
+  perfect 1.000. Disk footprint is essentially the same (~33 MB), and CLI
+  cold start is actually slightly faster (~0.15 s vs ~0.30 s for bge-small).
+- **`mode = code` is unchanged**: Jina embeddings v2 base code stays the
+  default for code sources.
+
+### Validation
+
+Head-to-head on 20 docs / 53 queries (mixed easy / medium / hard, paraphrase-heavy):
+
+| embedder | size | R@1 | MRR | hard R@1 | CLI cold |
+|---|---|---|---|---|---|
+| `bge-small-en-v1.5` *(prior default)* | ~30 MB | 0.868 | 0.928 | 0.900 | ~0.30s |
+| **`bge-base-en-v1.5-onnx-q`** *(new default)* | ~33 MB | **0.943** | **0.965** | **1.000** | **~0.15s** |
+| `bge-base-en-v1.5` (full precision) | ~110 MB | 0.925 | 0.956 | 0.950 | ~0.33s |
+| `embeddinggemma-300m-onnx` | ~333 MB | 0.943 | 0.967 | 0.950 | ~2s first |
+| qmd-query (LLM-augmented stack) | — | 0.962 | 0.981 | 0.950 | ~0.65s |
+
+dora's hybrid (bge-base-Q + FTS + literal + PRF) closes the gap to qmd's full
+LLM-augmented pipeline to **1.9 pts on R@1** with no LLM dependency, and ties
+the larger embeddinggemma model on R@1 at one-tenth the size.
+
+### Migration note
+
+Existing indexes carry the old `embedder_id` (`fastembed:Xenova/bge-small-en-v1.5`).
+On the first `dora index` after upgrade, dora's existing `meta_matches` path
+detects the mismatch, **wipes the source's DB, and re-embeds from scratch**.
+Expect ~4–10s on a small notes folder, ~5 minutes on a 10k-file vault.
+
+Users who want to keep the lighter bge-small embedder can pin it explicitly
+per source:
+
+```toml
+# <source>/.dora/config.toml
+[embedder]
+provider = "fastembed"
+model = "bge-small-en-v1.5"
+```
+
+### Docs
+
+- **README — new "Choosing an embedder" subsection** under "What's happening
+  under the hood", with the eval table above and a config-snippet showing
+  how to opt into bge-small / embeddinggemma / OpenAI.
+- **`docs/prds/optional-ollama-llm.md` permanently parked** — the 1.9 pt gap
+  to qmd-query doesn't justify the ollama dependency.
+- **`docs/ROADMAP.md` v0.8 (candle migration) demoted to "deferred"** —
+  fastembed 5 already unlocks the embedder catalog (incl. embeddinggemma)
+  we'd have used candle for.
+
 ## [0.6.0] — 2026-05-27
 
 ### Added

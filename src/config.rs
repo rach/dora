@@ -283,7 +283,7 @@ impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
             provider: "fastembed".into(),
-            model: "bge-small-en-v1.5".into(),
+            model: "bge-base-en-v1.5-onnx-q".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             dimensions: None,
         }

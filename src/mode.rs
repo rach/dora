@@ -129,10 +129,12 @@ impl Mode {
                 dimensions: None,
             },
             // ClaudeCode transcripts are prose (the user's natural-language prompts +
-            // assistant text), not code — use the prose embedder.
+            // assistant text), not code — use the prose embedder. v0.6.1 swapped from
+            // bge-small to the Qdrant-quantized bge-base, which scores +7.5pts R@1 on the
+            // maintainer's eval at the same disk footprint.
             _ => EmbedderConfig {
                 provider: "fastembed".into(),
-                model: "bge-small-en-v1.5".into(),
+                model: "bge-base-en-v1.5-onnx-q".into(),
                 api_key_env: "OPENAI_API_KEY".into(),
                 dimensions: None,
             },

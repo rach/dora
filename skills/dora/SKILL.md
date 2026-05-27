@@ -44,7 +44,8 @@ Options, in order of cost:
 2. Otherwise, read `.dora/config.toml` in the current folder. Look for `[source] mode = "..."`.
 3. Call `mcp__dora__list_sources()` and find the entry whose `path` matches the current folder.
    The response includes the embedder id — `jinaai/jina-embeddings-v2-base-code` means code mode,
-   `Xenova/bge-small-en-v1.5` means notes/obsidian/docs/claude-code mode.
+   any `bge-*-en-v1.5*` (default since v0.6.1 is `Qdrant/bge-base-en-v1.5-onnx-Q`,
+   older indexes may still report `Xenova/bge-small-en-v1.5`) means notes/obsidian/docs/claude-code mode.
 4. Run `dora source list` in the shell and check the output.
 
 If no `.dora/index.db` exists in the folder and the path isn't registered, **dora isn't set up

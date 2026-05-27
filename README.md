@@ -85,7 +85,7 @@ dora index ~/notes
 You should see something like:
 
 ```
-indexed: 73 inserted, 0 updated, 0 touched, 0 renamed, 0 deleted, 0 unchanged in 14.81s [model: fastembed:Xenova/bge-small-en-v1.5]
+indexed: 73 inserted, 0 updated, 0 touched, 0 renamed, 0 deleted, 0 unchanged in 14.81s [model: fastembed:Qdrant/bge-base-en-v1.5-onnx-Q]
 ```
 
 What just happened: dora walked `~/notes`, chunked each `.md` file, embedded each chunk using a small local ML model (auto-downloads ~80 MB the first time, cached for next time), and stored the result in `~/notes/.dora/index.db`. The first run takes seconds-to-minutes depending on vault size. Subsequent runs are basically instant for unchanged files.
@@ -303,6 +303,31 @@ flowchart TD
     COL -. best-effort .-> LOG[("usage table<br/>(query, embedding,<br/>returned chunks)<br/>→ v0.7 signal rerank")]
 ```
 
+### Choosing an embedder
+
+dora defaults to `bge-base-en-v1.5-onnx-q` (Qdrant's int8-quantized BGE-base). It hits the sweet spot of the accuracy / size / cold-start curve on the maintainer's 53-query eval fixture — same R@1 as a model 10× its size, and faster to load than a smaller-but-non-quantized alternative. You don't need to change this unless you have a specific reason.
+
+| Model | Size | R@1 | MRR | Notes |
+|---|---|---|---|---|
+| `bge-small-en-v1.5` | ~30 MB | 0.868 | 0.928 | lightest; fine for tiny corpora |
+| **`bge-base-en-v1.5-onnx-q`** *(default)* | ~33 MB | **0.943** | **0.965** | quantized, ties full-prec embeddinggemma |
+| `bge-base-en-v1.5` | ~110 MB | 0.925 | 0.956 | full precision, marginal lift over the quantized version |
+| `embeddinggemma-300m-onnx` | ~333 MB | 0.943 | 0.967 | matches qmd's embedder; +0.2pt MRR for 10× the size |
+
+Numbers from `~/.dora-eval-hard/` (20 docs, 53 queries — easy / medium / hard mix). PRF on for all rows. Your corpus may shift these by a few points; the relative ordering is stable. For a head-to-head, dora's full hybrid stack (bge-base-Q + FTS + literal + PRF) lands at 0.943 R@1 against qmd's LLM-augmented pipeline at 0.962 — a 1.9pt gap with no LLM dependency.
+
+OpenAI is supported via `provider = "openai"` (`text-embedding-3-small` / `text-embedding-3-large` / `ada-002`). Pay-per-use, no local model, costs surface in the index summary.
+
+To switch, edit `<source>/.dora/config.toml`:
+
+```toml
+[embedder]
+provider = "fastembed"
+model = "embeddinggemma-300m-onnx"  # or any other fastembed-supported code
+```
+
+The next `dora index` will detect the change, wipe the old vectors, and re-embed from scratch — the index DB tracks `embedder_id` and refuses to mix vectors from different models.
+
 **Indexing.** dora reads each `.md` file, splits it into chunks (respecting headings, code blocks, tables), generates a vector embedding per chunk using a small local ML model (default: a quantized BGE-base, ~33 MB ONNX file that runs on your laptop). Stores everything in SQLite alongside an FTS5 index.
 
 **Searching.** When you query, dora embeds the query the same way, then runs four searches in parallel: a keyword-based one (BM25 / FTS5 over the chunk content + heading path), a vector-similarity one, a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`), and a pseudo-relevance feedback arm (the top vector hits' most-frequent non-stopword tokens become a second FTS5 query — closes vocabulary gaps without an LLM). All four ranked lists merge via Reciprocal Rank Fusion. You get the top N results back.
@@ -321,12 +346,12 @@ A *mode* is a complete preset — chunker, embedder, file-extension filter, and 
 
 | Mode | Chunker | Default embedder | File extensions | Auto-detect trigger |
 |---|---|---|---|---|
-| `obsidian` | adaptive markdown + frontmatter synthesis | `bge-small-en-v1.5` | `.md` | `.obsidian/` directory exists |
-| `notes` | adaptive markdown | `bge-small-en-v1.5` | `.md` | `.md` files majority, no `.obsidian/` |
-| `docs` | adaptive markdown, smaller chunks | `bge-small-en-v1.5` | `.md`, `.mdx`, `.rst` | explicit only |
+| `obsidian` | adaptive markdown + frontmatter synthesis | `bge-base-en-v1.5-onnx-q` | `.md` | `.obsidian/` directory exists |
+| `notes` | adaptive markdown | `bge-base-en-v1.5-onnx-q` | `.md` | `.md` files majority, no `.obsidian/` |
+| `docs` | adaptive markdown, smaller chunks | `bge-base-en-v1.5-onnx-q` | `.md`, `.mdx`, `.rst` | explicit only |
 | `code` | tree-sitter (6-language registry) | `jina-embeddings-v2-base-code` | `.rs`, `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.java`, `.rb` | code-extension majority |
-| `claude-code` | per-user-turn JSONL chunker (project + timestamp + branch as heading) | `bge-small-en-v1.5` | `.jsonl` | path ends with `.claude/projects` |
-| `codex` | per-user-turn JSONL chunker for OpenAI Codex CLI transcripts | `bge-small-en-v1.5` | `.jsonl` | path ends with `.codex/sessions` |
+| `claude-code` | per-user-turn JSONL chunker (project + timestamp + branch as heading) | `bge-base-en-v1.5-onnx-q` | `.jsonl` | path ends with `.claude/projects` |
+| `codex` | per-user-turn JSONL chunker for OpenAI Codex CLI transcripts | `bge-base-en-v1.5-onnx-q` | `.jsonl` | path ends with `.codex/sessions` |
 | `auto` | resolved at index time | (resolved) | (resolved) | default — runs the rules above |
 
 ```sh
@@ -371,7 +396,7 @@ dora source add . --mode code --description "myproject — Go backend"
 ```
 REGISTRY
   · registry      2 source(s) registered
-  ✓ brain         /Users/me/brain, mode=obsidian, embedder=fastembed:Xenova/bge-small-en-v1.5
+  ✓ brain         /Users/me/brain, mode=obsidian, embedder=fastembed:Qdrant/bge-base-en-v1.5-onnx-Q
   ✓ myproject    /Users/me/Dev/myproject, mode=code, embedder=fastembed:jinaai/jina-embeddings-v2-base-code,
                   function=412 method=288 class=156 module=47 interface=18, 9214 links
 ```
@@ -612,7 +637,7 @@ mode = "code"                  # obsidian | notes | docs | code | auto (default)
 
 [embedder]
 # provider    = "fastembed"    # or "openai"
-# model       = "bge-small-en-v1.5"
+# model       = "bge-base-en-v1.5-onnx-q"
 # api_key_env = "OPENAI_API_KEY" # only for provider = "openai"
 # dimensions  = 1024           # openai-only
 
@@ -623,7 +648,7 @@ mode = "code"                  # obsidian | notes | docs | code | auto (default)
 
 Switching `mode` or `model` triggers a clean re-index on next run.
 
-**Local embedding models** (any of ~25 from fastembed's catalog): `bge-small-en-v1.5` (default), `bge-base-en-v1.5`, `bge-large-en-v1.5`, `multilingual-e5-small/base/large`, `all-minilm-l6-v2`, `nomic-embed-text-v1.5`, `jina-embeddings-v2-base-code`, `mxbai-embed-large-v1`, `modernbert-embed-large`, `bge-small-zh-v1.5`, `bge-large-zh-v1.5`, and more. Pick by name in config.
+**Local embedding models** (any of ~40 from fastembed's catalog): `bge-base-en-v1.5-onnx-q` (default), `bge-small-en-v1.5`, `bge-base-en-v1.5`, `bge-large-en-v1.5`, `embeddinggemma-300m-onnx`, `multilingual-e5-small/base/large`, `all-minilm-l6-v2`, `nomic-embed-text-v1.5`, `jina-embeddings-v2-base-code`, `mxbai-embed-large-v1`, `modernbert-embed-large`, `bge-small-zh-v1.5`, `bge-large-zh-v1.5`, and more. Pick by name in config; see [Choosing an embedder](#choosing-an-embedder) for the accuracy/size trade-offs.
 
 **OpenAI**: `text-embedding-3-small` (default 1536d, supports custom dims), `text-embedding-3-large` (3072d), `text-embedding-ada-002` (legacy). `dora index --dry-run` prints estimated cost before any API call.
 
