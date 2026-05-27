@@ -98,6 +98,31 @@ enum Command {
         /// Mutually exclusive with --include and --source.
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
         exclude: Vec<String>,
+
+        /// Serve HTTP+JSON-RPC at `--bind:--port` (default `127.0.0.1:8181`) instead of stdio.
+        /// Lets multiple MCP clients share one resident-models server. Pair with --daemon
+        /// to fork into the background; without --daemon the server runs in the foreground.
+        #[arg(long)]
+        http: bool,
+
+        /// HTTP bind address. Localhost-only by default; --bind 0.0.0.0 exposes beyond
+        /// loopback and prints a warning at startup.
+        #[arg(long, default_value = "127.0.0.1", value_name = "ADDR")]
+        bind: String,
+
+        /// HTTP port. Default 8181.
+        #[arg(long, default_value_t = 8181, value_name = "N")]
+        port: u16,
+
+        /// Fork into the background; write PID to ~/.config/dora/mcp-http.pid.
+        /// Requires --http. Unix only.
+        #[arg(long)]
+        daemon: bool,
+
+        /// Subcommand action — `stop` SIGTERMs a running daemon, `status` reports state.
+        /// When absent and no --http flag, runs stdio (the v0–v0.4 default).
+        #[command(subcommand)]
+        action: Option<McpAction>,
     },
     /// Manage the global source registry.
     Source {
@@ -154,6 +179,16 @@ enum Command {
         #[command(subcommand)]
         action: ContextAction,
     },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Stop a running HTTP daemon. Reads `~/.config/dora/mcp-http.pid`, sends SIGTERM,
+    /// waits up to 5s for the process to exit, then escalates to SIGKILL.
+    Stop,
+    /// Report whether the HTTP daemon is running + uptime + registered sources via GET
+    /// `http://<bind>:<port>/health`. Exit 0 if running, 1 if not.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -237,7 +272,16 @@ fn main() -> Result<()> {
             let source_root = path.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
             cmd_index(&source_root, dry_run)
         }
-        Some(Command::Mcp { source, include, exclude }) => cmd_mcp(source, include, exclude),
+        Some(Command::Mcp {
+            source,
+            include,
+            exclude,
+            http,
+            bind,
+            port,
+            daemon,
+            action,
+        }) => cmd_mcp(source, include, exclude, http, bind, port, daemon, action),
         Some(Command::Source { action }) => cmd_source(action),
         Some(Command::Install { client, include, exclude, no_shell, wrap }) => {
             cmd_install(client, include, exclude, !no_shell, wrap)
@@ -260,23 +304,170 @@ fn cmd_mcp(
     source_arg: Option<PathBuf>,
     include: Vec<String>,
     exclude: Vec<String>,
+    http: bool,
+    bind: String,
+    port: u16,
+    daemon: bool,
+    action: Option<McpAction>,
 ) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for mcp")?;
+    // Subcommand actions short-circuit: stop/status don't need to spin up a server.
+    if let Some(action) = action {
+        return match action {
+            McpAction::Stop => mcp_stop(&bind, port),
+            McpAction::Status => mcp_status(&bind, port),
+        };
+    }
+
+    // Optional fork-into-background. After this returns in the child, we continue normally;
+    // the parent has already exited.
+    if daemon {
+        if !http {
+            bail!("--daemon requires --http (stdio doesn't make sense as a background server)");
+        }
+        let pid_path = mcp_http_pid_path()?;
+        if let Some(parent) = pid_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Some(existing) = read_pid(&pid_path) {
+            if process_alive(existing) {
+                bail!("dora mcp http is already running on pid {existing}");
+            } else {
+                let _ = std::fs::remove_file(&pid_path);
+            }
+        }
+        let log_path = pid_path.with_file_name("mcp-http.log");
+        let stdout = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+            .with_context(|| format!("open daemon log {}", log_path.display()))?;
+        let stderr = stdout.try_clone()?;
+        daemonize::Daemonize::new()
+            .pid_file(&pid_path)
+            .working_directory(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
+            .stdout(stdout)
+            .stderr(stderr)
+            .start()
+            .context("daemonize")?;
+        // Child continues below.
+    }
+
+    let rt = if http {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for mcp http")?
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for mcp stdio")?
+    };
+
+    let transport = if http {
+        let addr: std::net::SocketAddr = format!("{bind}:{port}")
+            .parse()
+            .with_context(|| format!("invalid --bind/--port combo: {bind}:{port}"))?;
+        if !addr.ip().is_loopback() {
+            eprintln!(
+                "dora mcp: WARNING — exposing HTTP beyond loopback ({addr}). Indexed content \
+                 is searchable by anyone reaching this address."
+            );
+        }
+        mcp::Transport::Http { bind: addr }
+    } else {
+        mcp::Transport::Stdio
+    };
+
     match source_arg {
-        Some(path) => rt.block_on(mcp::run(&path)),
+        Some(path) if !http => rt.block_on(mcp::run(&path)),
+        Some(_) => bail!("--source is incompatible with --http; HTTP daemon serves the full registry"),
         None => {
             let mut reg = registry::Registry::load().context("load registry")?;
-            if reg.sources.is_empty() {
+            if reg.sources.is_empty() && !http {
                 bail!(
                     "no sources registered. Add one with `dora source add <path>`, or run \
                      `dora mcp --source <path>` for a one-off."
                 );
             }
             filter_registry(&mut reg, &include, &exclude)?;
-            rt.block_on(mcp::run_multi(reg))
+            rt.block_on(mcp::run_multi(reg, transport))
+        }
+    }
+}
+
+fn mcp_http_pid_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("could not determine $HOME")?;
+    Ok(home.join(".config").join("dora").join("mcp-http.pid"))
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn mcp_stop(bind: &str, port: u16) -> Result<()> {
+    let pid_path = mcp_http_pid_path()?;
+    let Some(pid) = read_pid(&pid_path) else {
+        eprintln!(
+            "dora mcp: no daemon pid found at {} (not running?)",
+            pid_path.display()
+        );
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        eprintln!("dora mcp: pid {pid} not alive — removing stale pid file");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
+    eprintln!("dora mcp: SIGTERM pid {pid}");
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    // Wait up to 5s for graceful exit.
+    for _ in 0..50 {
+        if !process_alive(pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if process_alive(pid) {
+        eprintln!("dora mcp: escalating to SIGKILL");
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    eprintln!("dora mcp: stopped (was on {bind}:{port})");
+    Ok(())
+}
+
+fn mcp_status(bind: &str, port: u16) -> Result<()> {
+    let url = format!("http://{bind}:{port}/health");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()?;
+    match client.get(&url).send().and_then(|r| r.text()) {
+        Ok(body) => {
+            println!("dora mcp: running");
+            println!("  url:    {url}");
+            println!("  health: {body}");
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("dora mcp: not running (no response at {url})");
+            std::process::exit(1);
         }
     }
 }

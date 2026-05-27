@@ -847,29 +847,120 @@ fn search_cross(
 
 // ---------------- entrypoints ----------------
 
+/// Pick the wire format the MCP server speaks on. stdio is the default (one subprocess per
+/// client, baked into the v0 install path). HTTP is the v0.5 addition for the
+/// many-clients-one-process deployment.
+#[derive(Debug, Clone)]
+pub enum Transport {
+    Stdio,
+    Http { bind: std::net::SocketAddr },
+}
+
 /// Multi-source MCP server. Loads every source in the registry, sharing embedder instances
 /// across sources that pick the same `(provider, model, dimensions)`.
-pub async fn run_multi(registry: Registry) -> Result<()> {
+pub async fn run_multi(registry: Registry, transport: Transport) -> Result<()> {
     let mut state = build_state(&registry.sources)?;
     if state.sources.is_empty() {
         anyhow::bail!("no sources could be loaded — check logs above for per-source errors");
     }
     log_ready(&state);
-    let server = DoraServer {
-        state: Arc::new(Mutex::new(std::mem::take(&mut state))),
+    let shared = Arc::new(Mutex::new(std::mem::take(&mut state)));
+
+    match transport {
+        Transport::Stdio => {
+            let server = DoraServer { state: shared };
+            server
+                .serve(stdio())
+                .await
+                .context("serve stdio MCP transport")?
+                .waiting()
+                .await
+                .context("waiting on MCP service")?;
+            Ok(())
+        }
+        Transport::Http { bind } => run_http(shared, bind).await,
+    }
+}
+
+/// HTTP transport. Mounts rmcp's `StreamableHttpService` at `/mcp` plus a tiny `/health`
+/// JSON endpoint that `dora doctor` + the daemon-detection helpers in `install.rs` use.
+/// State (the `Arc<Mutex<MultiSourceState>>`) is captured by the service factory closure,
+/// so all sessions share one MultiSourceState — embedders + Stores stay resident.
+async fn run_http(
+    state: Arc<Mutex<MultiSourceState>>,
+    bind: std::net::SocketAddr,
+) -> Result<()> {
+    use axum::routing::get;
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
+        tower::StreamableHttpService,
     };
-    server
-        .serve(stdio())
+
+    let started_at = std::time::Instant::now();
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let mut config = StreamableHttpServerConfig::default();
+    config.stateful_mode = false;
+
+    let factory_state = state.clone();
+    let svc = StreamableHttpService::new(
+        move || Ok(DoraServer { state: factory_state.clone() }),
+        session_manager,
+        config,
+    );
+
+    let health_state = state.clone();
+    let app = axum::Router::new()
+        .route(
+            "/health",
+            get(move || {
+                let state = health_state.clone();
+                async move { axum::Json(health_payload(&state, started_at)) }
+            }),
+        )
+        .nest_service("/mcp", svc);
+
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .context("serve stdio MCP transport")?
-        .waiting()
+        .with_context(|| format!("bind {}", bind))?;
+    eprintln!("dora mcp: http listening on http://{}", bind);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("dora mcp: SIGINT received, draining...");
+        })
         .await
-        .context("waiting on MCP service")?;
+        .context("axum http serve")?;
     Ok(())
 }
 
+#[derive(Serialize)]
+struct HealthPayload {
+    status: &'static str,
+    version: &'static str,
+    uptime_secs: u64,
+    sources: Vec<String>,
+}
+
+fn health_payload(
+    state: &Arc<Mutex<MultiSourceState>>,
+    started_at: std::time::Instant,
+) -> HealthPayload {
+    let sources = state
+        .lock()
+        .ok()
+        .map(|g| g.order.clone())
+        .unwrap_or_default();
+    HealthPayload {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: started_at.elapsed().as_secs(),
+        sources,
+    }
+}
+
 /// Single-source MCP server (used by `dora mcp --source <path>`). Builds a synthetic
-/// one-entry registry and reuses `run_multi`'s implementation.
+/// one-entry registry and reuses `run_multi`'s implementation. Always stdio — single-source
+/// is a one-off interactive path; HTTP daemon is meant for the multi-source registry.
 pub async fn run(source_root: &Path) -> Result<()> {
     let source_root = source_root.canonicalize().context("canonicalize source path")?;
     let name = source_root
@@ -883,7 +974,7 @@ pub async fn run(source_root: &Path) -> Result<()> {
             description: None,
         }],
     };
-    run_multi(registry).await
+    run_multi(registry, Transport::Stdio).await
 }
 
 fn build_state(sources: &[Source]) -> Result<MultiSourceState> {

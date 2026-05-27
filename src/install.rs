@@ -80,18 +80,27 @@ pub fn run(
     let cursor_path = home.join(".cursor").join("mcp.json");
     let codex_path = home.join(".codex").join("config.toml");
 
+    // Auto-detect HTTP daemon: if `dora mcp --http --daemon` is currently running, write the
+    // HTTP transport shape into each client config instead of the stdio launch command. This
+    // lets the persistent server share its loaded models across all MCP clients. If the
+    // daemon goes down later, `dora doctor` will surface the mismatch.
+    let http_url = detect_http_daemon();
+    if let Some(url) = &http_url {
+        eprintln!("dora install: detected http daemon at {url} — writing http transport to client configs");
+    }
+
     let claude = if matches!(client, Client::All | Client::Claude) {
-        patch_json_host(&claude_path, &binary_path, &args)
+        patch_json_host(&claude_path, &binary_path, &args, http_url.as_deref())
     } else {
         HostAction::SkippedByFilter
     };
     let cursor = if matches!(client, Client::All | Client::Cursor) {
-        patch_json_host(&cursor_path, &binary_path, &args)
+        patch_json_host(&cursor_path, &binary_path, &args, http_url.as_deref())
     } else {
         HostAction::SkippedByFilter
     };
     let codex = if matches!(client, Client::All | Client::Codex) {
-        patch_toml_host(&codex_path, &binary_path, &args)
+        patch_toml_host(&codex_path, &binary_path, &args, http_url.as_deref())
     } else {
         HostAction::SkippedByFilter
     };
@@ -112,6 +121,45 @@ pub fn run(
     })
 }
 
+/// True iff a `dora mcp --http` daemon is currently running and answering /health on the
+/// default 127.0.0.1:8181. Returns the URL to wire into client configs.
+fn detect_http_daemon() -> Option<String> {
+    let pid_path = dirs::home_dir()?
+        .join(".config")
+        .join("dora")
+        .join("mcp-http.pid");
+    if !pid_path.exists() {
+        return None;
+    }
+    let pid = std::fs::read_to_string(&pid_path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !alive {
+        return None;
+    }
+    let url = "http://127.0.0.1:8181/mcp";
+    // Cheap reachability check — if /health doesn't respond, assume non-default bind and
+    // fall back to stdio. The user can rerun `dora install` after `dora mcp stop` if needed.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .ok()?;
+    client
+        .get("http://127.0.0.1:8181/health")
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    Some(url.to_string())
+}
+
 fn build_mcp_args(include: &[String], exclude: &[String]) -> Vec<String> {
     let mut args = vec!["mcp".to_string()];
     if !include.is_empty() {
@@ -126,7 +174,12 @@ fn build_mcp_args(include: &[String], exclude: &[String]) -> Vec<String> {
 
 // ---------- JSON-format hosts (Claude Code, Cursor) ----------
 
-fn patch_json_host(path: &Path, binary_path: &Path, args: &[String]) -> HostAction {
+fn patch_json_host(
+    path: &Path,
+    binary_path: &Path,
+    args: &[String],
+    http_url: Option<&str>,
+) -> HostAction {
     if !path.exists() {
         return HostAction::NotInstalled;
     }
@@ -149,10 +202,14 @@ fn patch_json_host(path: &Path, binary_path: &Path, args: &[String]) -> HostActi
         return HostAction::Failed("root is not an object".to_string());
     }
 
-    let target = json!({
-        "command": binary_path.display().to_string(),
-        "args": args,
-    });
+    let target = if let Some(url) = http_url {
+        json!({ "url": url })
+    } else {
+        json!({
+            "command": binary_path.display().to_string(),
+            "args": args,
+        })
+    };
 
     // Ensure mcpServers exists as an object.
     let mcp_servers = root
@@ -185,7 +242,12 @@ fn patch_json_host(path: &Path, binary_path: &Path, args: &[String]) -> HostActi
 
 // ---------- TOML-format hosts (Codex CLI) ----------
 
-fn patch_toml_host(path: &Path, binary_path: &Path, args: &[String]) -> HostAction {
+fn patch_toml_host(
+    path: &Path,
+    binary_path: &Path,
+    args: &[String],
+    http_url: Option<&str>,
+) -> HostAction {
     if !path.exists() {
         return HostAction::NotInstalled;
     }
@@ -215,18 +277,22 @@ fn patch_toml_host(path: &Path, binary_path: &Path, args: &[String]) -> HostActi
     };
 
     let mut new_entry = toml::value::Table::new();
-    new_entry.insert(
-        "command".to_string(),
-        toml::Value::String(binary_path.display().to_string()),
-    );
-    new_entry.insert(
-        "args".to_string(),
-        toml::Value::Array(
-            args.iter()
-                .map(|s| toml::Value::String(s.clone()))
-                .collect(),
-        ),
-    );
+    if let Some(url) = http_url {
+        new_entry.insert("url".to_string(), toml::Value::String(url.to_string()));
+    } else {
+        new_entry.insert(
+            "command".to_string(),
+            toml::Value::String(binary_path.display().to_string()),
+        );
+        new_entry.insert(
+            "args".to_string(),
+            toml::Value::Array(
+                args.iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     let target = toml::Value::Table(new_entry);
 
     if let Some(existing) = mcp_map.get("dora") {

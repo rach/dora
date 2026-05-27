@@ -189,29 +189,47 @@ dora doctor
 
 You should see all green ✓ checks. If anything is `⚠` or `✗`, the message tells you what to fix.
 
+### Step 5.25 — (Optional) Persistent HTTP daemon (multi-client setups)
+
+If you have multiple MCP clients (Claude Code + Cursor + Codex, or several
+Claude Code workspaces in parallel), each one launches its own `dora mcp` stdio
+subprocess and reloads ~80 MB of ONNX weights into RAM. Painful at cold start.
+
+Switch to the shared HTTP daemon instead:
+
+```sh
+dora mcp --http --daemon          # forks into the background, PID at ~/.config/dora/mcp-http.pid
+dora mcp status                   # uptime + source list
+dora mcp stop                     # SIGTERM (escalates to SIGKILL after 5s)
+```
+
+Or run it as a launchd service via Homebrew (auto-starts on login, restarts on crash):
+
+```sh
+brew services start dora          # service definition runs `dora mcp --http`
+```
+
+When the daemon's alive, **`dora install`** auto-detects it and writes
+`{"url": "http://127.0.0.1:8181/mcp"}` into each MCP client's config instead of
+the stdio launch command — clients connect over HTTP and share the loaded models.
+
+If you shut the daemon down later, re-run `dora install` to flip clients back to
+stdio. `dora doctor` shows the daemon's state under MCP DAEMON.
+
 ### Step 5.5 — (Optional) Run a background watcher
 
 Without a watcher, dora self-heals on every query (it diffs the vault if mtimes changed since the last walk). With one, you skip that mid-query catch-up and indexing is always already-fresh.
 
-If you installed via Homebrew, the easiest path is `brew services`:
+`brew services start dora` runs the HTTP daemon (see Step 5.25), not watch — Homebrew formulas only support one service block. For the watcher, run it manually:
 
 ```sh
-brew services start dora        # launchd plist + watcher running
-brew services list              # shows status
-brew services stop dora         # to stop
+dora watch                                              # foreground; Ctrl-C to stop
+nohup dora watch > /tmp/dora-watch.log 2>&1 &           # background
 ```
 
-That auto-restarts the watcher on login and on crash. Logs land in `/opt/homebrew/var/log/dora-watch.log`. **Safe to run before registering any sources** — the watcher waits and picks up the first `dora source add` automatically.
+The watcher auto-picks up any source you add later via `dora source add` — no restart needed. `dora source add` prints a hint telling you whether a watcher is already running or not. **Safe to start before registering any sources** — the watcher waits and picks up the first `dora source add` automatically.
 
-Without Homebrew (or if you prefer foreground):
-
-```sh
-dora watch          # foreground; Ctrl-C to stop
-# or, send it to the background:
-nohup dora watch > /tmp/dora-watch.log 2>&1 &
-```
-
-The watcher auto-picks up any source you add later via `dora source add` — no restart needed. `dora source add` prints a hint telling you whether a watcher is already running or not.
+If you want watch to start on login like brew-services would, write a per-user launchd plist at `~/Library/LaunchAgents/dora-watch.plist` pointing at `/opt/homebrew/bin/dora watch`. (v0.2.1–v0.4.x users whose `brew services start dora` ran watch automatically should follow this step after upgrading to v0.5.)
 
 ### Step 6 — Use it from Claude Code
 
@@ -389,6 +407,8 @@ dora doctor                                                      # health check,
 dora mcp [--include …] [--exclude …] [--source <path>]           # run the MCP server (usually called by Claude Code itself)
 dora watch [--include …] [--exclude …]                           # foreground watcher that keeps things fresh proactively
 dora wrappers <on|off|status>                                    # toggle the grep/rg/ag/find shell wrappers without editing ~/.zshrc
+dora mcp --http [--bind ADDR] [--port N] [--daemon]              # serve MCP over HTTP for multi-client setups (one persistent process, resident models)
+dora mcp <stop|status>                                           # SIGTERM the http daemon / report uptime
 ```
 
 ### Output modes for agents

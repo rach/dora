@@ -29,6 +29,7 @@ pub struct DoctorReport {
     pub binary: Vec<Check>,
     pub registry: Vec<Check>,
     pub mcp_hosts: Vec<Check>,
+    pub mcp_daemon: Vec<Check>,
     pub shell: Vec<Check>,
     pub watcher: Vec<Check>,
 }
@@ -51,6 +52,7 @@ impl DoctorReport {
             &self.binary,
             &self.registry,
             &self.mcp_hosts,
+            &self.mcp_daemon,
             &self.shell,
             &self.watcher,
         ]
@@ -68,7 +70,106 @@ pub fn run() -> Result<DoctorReport> {
         report.shell = check_shell_wrapper(h);
     }
     report.watcher = check_watcher();
+    report.mcp_daemon = check_mcp_daemon();
     Ok(report)
+}
+
+// ---------- MCP HTTP daemon ----------
+
+fn check_mcp_daemon() -> Vec<Check> {
+    let mut out = Vec::new();
+    let Some(home) = dirs::home_dir() else {
+        return out;
+    };
+    let pid_path = home.join(".config").join("dora").join("mcp-http.pid");
+    if !pid_path.exists() {
+        out.push(Check {
+            status: CheckStatus::Info,
+            label: "mcp daemon".into(),
+            detail: "not running (optional; clients use stdio if so)".to_string(),
+        });
+        return out;
+    }
+    let pid_str = std::fs::read_to_string(&pid_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid_str])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !alive {
+        let _ = std::fs::remove_file(&pid_path);
+        out.push(Check {
+            status: CheckStatus::Warn,
+            label: "mcp daemon".into(),
+            detail: format!(
+                "stale pid {pid_str} in {} — cleaned up. Run `dora mcp --http --daemon` to restart.",
+                pid_path.display()
+            ),
+        });
+        return out;
+    }
+    // Liveness check via /health. Default bind is 127.0.0.1:8181; if the user overrode it,
+    // they'll see the warning below and can confirm manually.
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            out.push(Check {
+                status: CheckStatus::Info,
+                label: "mcp daemon".into(),
+                detail: format!("pid {pid_str} alive (couldn't build http client to ping /health)"),
+            });
+            return out;
+        }
+    };
+    match client
+        .get("http://127.0.0.1:8181/health")
+        .send()
+        .and_then(|r| r.text())
+    {
+        Ok(body) => {
+            let uptime = body
+                .split("\"uptime_secs\":")
+                .nth(1)
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            out.push(Check {
+                status: CheckStatus::Ok,
+                label: "mcp daemon".into(),
+                detail: format!(
+                    "running on http://127.0.0.1:8181 (pid {pid_str}, uptime {})",
+                    human_uptime(uptime)
+                ),
+            });
+        }
+        Err(_) => {
+            out.push(Check {
+                status: CheckStatus::Warn,
+                label: "mcp daemon".into(),
+                detail: format!(
+                    "pid {pid_str} alive but /health didn't respond on default port. Custom \
+                     --bind/--port? Otherwise run `dora mcp stop` to reset."
+                ),
+            });
+        }
+    }
+    out
+}
+
+fn human_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 // ---------- binary ----------
@@ -524,6 +625,7 @@ pub fn render(r: &DoctorReport) -> String {
     out.push_str(&render_section("BINARY", &r.binary));
     out.push_str(&render_section("REGISTRY", &r.registry));
     out.push_str(&render_section("MCP HOSTS", &r.mcp_hosts));
+    out.push_str(&render_section("MCP DAEMON", &r.mcp_daemon));
     out.push_str(&render_section("SHELL", &r.shell));
     out.push_str(&render_section("WATCHER", &r.watcher));
     let errs = r.errors();

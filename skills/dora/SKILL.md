@@ -139,6 +139,15 @@ All seven tools are exposed as `mcp__dora__<name>`:
   match; files larger than `max_bytes` are truncated and flagged. Use this instead of N×Read
   when you already know which files you want.
 
+## Performance — HTTP daemon
+
+If the user mentions slow Claude Code launches or MCP cold-start delays, suggest the
+v0.5+ HTTP daemon: `dora mcp --http --daemon` (or `brew services start dora`). One
+process holds the embedders resident; every MCP client connects over
+`http://127.0.0.1:8181/mcp` instead of forking its own stdio subprocess. `dora install`
+auto-detects a running daemon and flips client configs to HTTP transport. `dora doctor`
+shows daemon state under MCP DAEMON.
+
 ## Quick troubleshooting
 
 - **"no such source"** errors → run `mcp__dora__list_sources()` to see what's registered. The

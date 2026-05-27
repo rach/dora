@@ -4,6 +4,60 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-27
+
+### Added
+
+- **`dora mcp --http`** — serve MCP over JSON-RPC over HTTP at `127.0.0.1:8181/mcp`
+  (override with `--bind` / `--port`). One persistent server, models stay resident
+  across requests, all MCP clients share. Closes the "every Claude Code launch
+  reloads 200 MB of ONNX" problem.
+- **`dora mcp --http --daemon`** — fork into the background, write PID to
+  `~/.config/dora/mcp-http.pid`, log to a file next to the PID. Uses the
+  `daemonize` crate (Unix-only). `keep_alive` semantics via brew-services.
+- **`dora mcp stop`** — SIGTERM the daemon, escalate to SIGKILL after 5s, clean
+  up the PID file.
+- **`dora mcp status`** — GET `http://127.0.0.1:8181/health`, print uptime +
+  registered sources, exit 0 if running, 1 if not.
+- **`GET /health`** endpoint on the HTTP server returning
+  `{status, version, uptime_secs, sources}` — used by `dora doctor` and
+  `dora install` for transport auto-detection.
+- **`dora install` transport auto-detection.** Before patching each client config,
+  the installer checks whether the HTTP daemon is alive (PID + `/health`). If so,
+  writes `{"url": "http://127.0.0.1:8181/mcp"}` into the MCP host config instead
+  of the stdio launch command. If the daemon stops later, doctor surfaces the
+  drift.
+- **`dora doctor` MCP DAEMON section** — reports running/stopped state + uptime,
+  cleans up stale PID files automatically.
+
+### Changed
+
+- **Brew service now runs `dora mcp --http`, not `dora watch`** (Homebrew formulas
+  only support one `service` block). v0.2.1–v0.4.x users with
+  `brew services start dora` running their watch process need to restart watch
+  manually after upgrade — e.g. `nohup dora watch > /tmp/dora-watch.log 2>&1 &`,
+  or create their own launchd plist. The HTTP daemon delivers a bigger UX win
+  (no more cold-start ONNX reloads on every Claude Code launch) so the brew
+  service slot goes to it by default.
+- `mcp::run_multi` now takes a `Transport` (stdio or http) instead of being
+  stdio-only. Existing callers updated; behavior unchanged when transport is
+  stdio.
+- `src/main.rs::cmd_mcp` reshaped: `dora mcp` keeps its stdio default; new flags
+  `--http / --bind / --port / --daemon` and subcommands `stop / status` opt into
+  the HTTP path.
+- `tokio` features extended to `rt-multi-thread`, `signal`, `net` for the axum
+  HTTP server. Stdio still uses the current-thread runtime; only HTTP spins up
+  multi-thread.
+
+### Notes
+
+- HTTP daemon is **localhost-only by default** (`127.0.0.1`). Passing
+  `--bind 0.0.0.0` is accepted but prints a warning — indexed content becomes
+  searchable by anyone on the network.
+- No TLS, no auth. For cross-machine setups, put a reverse proxy in front.
+- Idle unload of per-source `Store` connections deferred to v0.5.1; the first
+  cut keeps everything resident, predictable RAM cost.
+
 ## [0.4.1] — 2026-05-26
 
 ### Changed
