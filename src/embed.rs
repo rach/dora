@@ -63,7 +63,11 @@ pub fn cache_key(cfg: &EmbedderConfig) -> String {
 // ---------------- fastembed (local ONNX) ----------------
 
 pub struct FastembedEmbedder {
-    inner: TextEmbedding,
+    /// fastembed 5's `TextEmbedding::embed` takes `&mut self`, so we wrap it in a Mutex to
+    /// keep the `Embedder` trait's `&self` contract. The mutex is contended only when two
+    /// MCP requests embed concurrently — which is rare since one embed call dominates
+    /// search latency anyway, and the search itself is per-source single-threaded.
+    inner: std::sync::Mutex<TextEmbedding>,
     id: String,
     dims: usize,
 }
@@ -72,17 +76,50 @@ impl FastembedEmbedder {
     pub fn new(model_name: &str, model_cache_dir: PathBuf) -> Result<Self> {
         let (model, dims, canonical_code) = resolve_fastembed_model(model_name)?;
         std::fs::create_dir_all(&model_cache_dir).ok();
+        // First-time setup nudge: fastembed's download progress bar lands on stderr,
+        // but there's a noticeable gap (~1-3s) between "user hit enter" and the bar
+        // appearing while it resolves the HF endpoint. Print our own line first so the
+        // user knows the wait is intentional and doesn't think dora is hung. When the
+        // model is already cached the load is fast enough that we stay silent.
+        if !model_cache_populated(&model_cache_dir) {
+            eprintln!(
+                "dora: first-time setup — downloading embedder model {canonical_code} \
+                 (one-time per source; progress below)..."
+            );
+        }
         let inner = TextEmbedding::try_new(
             InitOptions::new(model)
                 .with_cache_dir(model_cache_dir)
                 .with_show_download_progress(true),
         )?;
         Ok(Self {
-            inner,
+            inner: std::sync::Mutex::new(inner),
             id: format!("fastembed:{canonical_code}"),
             dims,
         })
     }
+}
+
+/// True iff `cache_dir` already contains a downloaded model (any `.onnx*` file under it).
+/// Used purely for the "downloading vs loading" UX message; if our heuristic guesses wrong
+/// the user just sees a slightly off label, no functional impact.
+fn model_cache_populated(cache_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if model_cache_populated(&path) {
+                return true;
+            }
+        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            if ext.starts_with("onnx") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl Embedder for FastembedEmbedder {
@@ -93,7 +130,11 @@ impl Embedder for FastembedEmbedder {
         self.dims
     }
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(self.inner.embed(texts.to_vec(), None)?)
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow!("fastembed mutex poisoned: {e}"))?;
+        Ok(guard.embed(texts.to_vec(), None)?)
     }
 }
 

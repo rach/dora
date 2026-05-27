@@ -4,6 +4,65 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-27
+
+### Added
+
+- **Pseudo-relevance feedback (PRF) as a fourth retrieval arm.** After FTS, vector
+  ANN, and literal substring scan, dora now mines the top vector-ANN chunks for
+  their most-frequent non-stopword, non-query-word tokens (up to 5) and runs them
+  as an additional FTS query. The result joins the RRF merge alongside the other
+  three arms, closing vocabulary gaps without an LLM. Always-on; no config knob.
+- **Usage signal logging** via new `usage` table (migration #2). Every search
+  records `(query_text, query_embedding, returned_chunks, used_chunk_id, ts)`.
+  Data-collection only in v0.6 — v0.7 turns it into ranking signal, v0.9 turns it
+  into LoRA fine-tuning input.
+- **MCP-side use attribution.** When an MCP client calls `multi_get` on a path
+  the most recent `search` (within 60s) returned, the matching `usage` row's
+  `used_chunk_id` gets patched. Ring buffer caps at 64 recent searches; CLI
+  invocations stay unattributed (best-effort signal).
+
+### Validation
+
+Head-to-head against qmd's published 18-query eval set (`test/eval-docs/`):
+
+| config       | N  | R@1   | R@5   | R@10  | MRR   |
+| ------------ | -- | ----- | ----- | ----- | ----- |
+| dora (PRF)   | 18 | 1.000 | 1.000 | 1.000 | 1.000 |
+| dora (no PRF)| 18 | 1.000 | 1.000 | 1.000 | 1.000 |
+| ripgrep -l   | 18 |   .056|   .056|   .056|   .056|
+
+dora's hybrid (FTS + vector + literal + PRF) hits perfect R@1 on every easy /
+medium / hard query in qmd's fixture — no LLM, no Python, no ollama. qmd cannot
+exceed 1.000 either, so we're within the PRD's "±5 R@5 points of qmd" acceptance
+window. PRF lands clean (no regression vs. no-PRF on this fixture), but the
+6-doc set is too small to differentiate; PRF's value will surface on diverse
+real-world corpora where multiple docs compete for the same query. The eval
+harness lives at `scripts/eval.sh` (maintainer-only, gitignored) for re-running
+on broader fixtures as v0.7+ lands.
+
+- **Minimalist colored CLI renderer** with inline previews. `dora "query"`
+  now prints one header line per hit (`path:line  [heading]  ★score`, with
+  bold-magenta / green / cyan / dim-yellow when stdout is a TTY) followed by
+  up to 4 lines of preview from the matched chunk under a thin `│` bar.
+  Pipes and `NO_COLOR=1` strip the ANSI codes automatically; `--json` and
+  `--files` modes are unchanged.
+- **First-time setup UX**. When a source uses an embedder model that isn't
+  yet cached, dora prints `first-time setup — downloading embedder model ...`
+  before fastembed's progress bar so users see immediate feedback instead of
+  a blank terminal during the HF endpoint resolve.
+- **README retrieval-pipeline diagram** (mermaid, renders inline on GitHub).
+  Visualizes the four-arm fusion + per-file collapse + usage-table side-channel.
+
+### Changed
+
+- `Hit` now exposes `chunk_id` — needed for the MCP use-attribution path and the
+  v0.7 signal-based reranker. JSON-serialized output gains the field.
+- **`fastembed = "5"`** (was 4). Unlocks `embeddinggemma-300m-onnx` and a wider
+  catalog without touching dora's embedder API. `TextEmbedding::embed` became
+  `&mut self` in 5.x, so `FastembedEmbedder` wraps it in a Mutex to keep the
+  `Embedder` trait's `&self` contract.
+
 ## [0.5.0] — 2026-05-27
 
 ### Added

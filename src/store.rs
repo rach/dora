@@ -539,6 +539,50 @@ impl Store {
         Ok(out)
     }
 
+    // ---------- usage logging (v0.6) ----------
+
+    /// Append one row to the `usage` table: which query was run, what we returned, with the
+    /// query's embedding (so v0.7's signal-based reranker can score similarity-to-past-query
+    /// without re-embedding). `used_chunk_id` starts NULL — patched in by `mark_used` if an
+    /// MCP follow-up call signals the user/agent actually consumed one of the returned hits.
+    pub fn log_usage(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        returned_chunks_json: &str,
+    ) -> Result<i64> {
+        let bytes = f32_vec_to_bytes(query_embedding);
+        self.conn.execute(
+            "INSERT INTO usage (query_text, query_embedding, returned_chunks, used_chunk_id, created_at) \
+             VALUES (?, ?, ?, NULL, ?)",
+            params![query, bytes, returned_chunks_json, now_secs()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Locate the most recent un-attributed usage row whose `query_text` matches the given
+    /// query and was logged within `max_age_secs` seconds, then patch its `used_chunk_id`.
+    /// Returns true iff a row was updated. Used by the MCP ring buffer to attribute a
+    /// follow-up `multi_get` read back to its originating search.
+    pub fn mark_used_by_query(
+        &self,
+        query: &str,
+        chunk_id: i64,
+        max_age_secs: i64,
+    ) -> Result<bool> {
+        let cutoff = now_secs() - max_age_secs;
+        let affected = self.conn.execute(
+            "UPDATE usage SET used_chunk_id = ? \
+             WHERE id = ( \
+                 SELECT id FROM usage \
+                 WHERE query_text = ? AND used_chunk_id IS NULL AND created_at >= ? \
+                 ORDER BY created_at DESC LIMIT 1 \
+             )",
+            params![chunk_id, query, cutoff],
+        )?;
+        Ok(affected > 0)
+    }
+
     // ---------- code-aware lookups (sub-slice E) ----------
 
     pub fn find_definitions(&self, symbol: &str, limit: usize) -> Result<Vec<DefinitionHit>> {
@@ -1006,6 +1050,52 @@ mod tests {
             "Engineering nuggets",
             "after removing the deepest, the parent prefix takes over"
         );
+    }
+
+    /// usage rows round-trip through log_usage → mark_used_by_query, including the
+    /// "no recent match" branch and the time-window guard.
+    #[test]
+    fn usage_log_and_attribution_roundtrip() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("u.db");
+        let store = Store::open(&db, 4).unwrap();
+
+        let emb = vec![0.1f32, 0.2, 0.3, 0.4];
+        let usage_id = store.log_usage("how to track ICP", &emb, "[1,2,3]").unwrap();
+        assert!(usage_id > 0);
+
+        // Matching query within window → attribution succeeds.
+        let patched = store
+            .mark_used_by_query("how to track ICP", 42, 60)
+            .unwrap();
+        assert!(patched, "matching query inside window should patch a row");
+
+        // The same row can't be patched twice (used_chunk_id is no longer NULL).
+        let patched_again = store
+            .mark_used_by_query("how to track ICP", 99, 60)
+            .unwrap();
+        assert!(
+            !patched_again,
+            "already-attributed row must not be re-patched"
+        );
+
+        // Non-matching query → no-op.
+        let nonmatch = store
+            .mark_used_by_query("something else entirely", 7, 60)
+            .unwrap();
+        assert!(!nonmatch);
+
+        // Confirm the stored row carries the expected used_chunk_id.
+        let used: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT used_chunk_id FROM usage WHERE id = ?",
+                params![usage_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(used, Some(42));
     }
 
     /// Migrations run once on first open, are recorded, and don't re-apply on subsequent

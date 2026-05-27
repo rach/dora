@@ -29,6 +29,21 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
          ); \
          CREATE INDEX IF NOT EXISTS idx_contexts_prefix ON contexts(path_prefix);",
     ),
+    // v0.6: usage signal. Logged best-effort on every search; the `used_chunk_id` is
+    // patched in if a follow-up MCP `multi_get` (or future Read-equivalent) reads a path
+    // the search just returned. Feeds v0.7's signal-based reranker and v0.9's LoRA pass.
+    (
+        2,
+        "CREATE TABLE IF NOT EXISTS usage ( \
+             id              INTEGER PRIMARY KEY, \
+             query_text      TEXT NOT NULL, \
+             query_embedding BLOB NOT NULL, \
+             returned_chunks TEXT NOT NULL, \
+             used_chunk_id   INTEGER, \
+             created_at      INTEGER NOT NULL \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_usage_created ON usage(created_at);",
+    ),
 ];
 
 /// Apply any migrations whose version is newer than the `MAX(version)` in the

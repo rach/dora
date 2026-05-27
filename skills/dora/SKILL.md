@@ -25,6 +25,11 @@ exposes 6 MCP tools that Claude should prefer over grep/Glob/Read for the questi
 in the description above. This skill tells you which tool to reach for, in which order, based on
 what *mode* the source is in.
 
+> As of v0.6: dora's `search` does pseudo-relevance feedback automatically — natural-language
+> queries that don't share vocabulary with the corpus still get good recall without any config.
+> Hits now carry a `chunk_id` field; reading the matched file via `multi_get` within ~60s
+> signals back to dora that the hit was useful, which informs future ranking (v0.7+).
+
 ## Step 1 — detect the source mode
 
 Before answering, find out which source(s) the question is about: a **code** source, a **notes**

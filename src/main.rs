@@ -903,19 +903,154 @@ fn cmd_search(
         }
         return Ok(());
     }
-    for h in hits {
-        if h.heading_path.is_empty() {
-            println!("{}:{}: {}", h.path, h.line, h.snippet);
-        } else {
-            println!("{}:{}: [{}] {}", h.path, h.line, h.heading_path, h.snippet);
+    let style = AnsiStyle::detect();
+    for (i, h) in hits.iter().enumerate() {
+        if i > 0 {
+            println!();
         }
-        if let Some(ctx) = h.context.as_deref() {
-            // Indented continuation so the path:line column stays scannable. Only renders
-            // when the user registered a context for this path's subtree.
-            println!("       context: {ctx}");
-        }
+        render_hit_rich(&store, h, &style);
     }
     Ok(())
+}
+
+/// Minimalist `rg`-inspired text rendering: one header line per hit (path:line + heading
+/// + score badge), then up to ~4 preview lines from the chunk indented under a thin bar.
+/// Falls back to plain text + no decorations when stdout isn't a TTY (so pipes into jq,
+/// grep, awk continue to see machine-parseable output).
+fn render_hit_rich(store: &Store, h: &search::Hit, style: &AnsiStyle) {
+    let header = format_header(h, style);
+    println!("{header}");
+    if let Some(ctx) = h.context.as_deref() {
+        println!(
+            "  {italic_dim}context: {ctx}{reset}",
+            italic_dim = style.italic_dim,
+            reset = style.reset,
+        );
+    }
+    // Pull the chunk's full content for the preview. Best-effort: a missing chunk_id
+    // (shouldn't happen — we just retrieved it) falls back to the precomputed snippet.
+    let preview_text = match store.fetch_chunk(h.chunk_id) {
+        Ok(Some(chunk)) => chunk.content,
+        _ => h.snippet.clone(),
+    };
+    let preview_text = strip_leading_frontmatter_str(&preview_text);
+    let mut emitted = 0usize;
+    for line in preview_text.lines() {
+        let trimmed = line.trim_end();
+        // Drop blank and pure-heading-marker lines from the preview — they waste vertical
+        // space without informing the reader. The first heading is already in the header
+        // line we just printed.
+        if trimmed.is_empty() || trimmed.starts_with("# ") || trimmed.starts_with("## ") {
+            continue;
+        }
+        let truncated = truncate_chars(trimmed, 100);
+        println!(
+            "  {dim}\u{2502}{reset} {body}",
+            dim = style.dim,
+            reset = style.reset,
+            body = truncated,
+        );
+        emitted += 1;
+        if emitted >= 4 {
+            break;
+        }
+    }
+}
+
+fn format_header(h: &search::Hit, style: &AnsiStyle) -> String {
+    let path_line = format!(
+        "{path_open}{path}{reset}:{line_open}{line}{reset}",
+        path_open = style.path,
+        path = h.path,
+        reset = style.reset,
+        line_open = style.line_num,
+        line = h.line,
+    );
+    let heading = if h.heading_path.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  {hdr_open}[{hdr}]{reset}",
+            hdr_open = style.heading,
+            hdr = h.heading_path,
+            reset = style.reset,
+        )
+    };
+    let score = format!(
+        "  {s_open}\u{2605}{score:.3}{reset}",
+        s_open = style.score,
+        score = h.score,
+        reset = style.reset,
+    );
+    format!("{path_line}{heading}{score}")
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}\u{2026}")
+}
+
+/// Best-effort YAML-frontmatter stripper for preview text — mirrors `search::strip_leading_frontmatter`.
+fn strip_leading_frontmatter_str(content: &str) -> &str {
+    let trimmed = content.trim_start_matches('\u{feff}');
+    let mut lines = trimmed.lines();
+    let Some(first) = lines.next() else { return content; };
+    if first.trim() != "---" {
+        return content;
+    }
+    let mut consumed = first.len() + 1;
+    for line in lines {
+        consumed += line.len() + 1;
+        if line.trim() == "---" {
+            return &trimmed[consumed.min(trimmed.len())..];
+        }
+    }
+    content
+}
+
+/// ANSI styling resolved once per invocation. Honors the `NO_COLOR` standard
+/// (https://no-color.org/) and falls back to empty escape codes when stdout isn't a TTY,
+/// so piping into `jq`, `awk`, or shell wrappers stays clean.
+struct AnsiStyle {
+    path: &'static str,
+    line_num: &'static str,
+    heading: &'static str,
+    score: &'static str,
+    dim: &'static str,
+    italic_dim: &'static str,
+    reset: &'static str,
+}
+
+impl AnsiStyle {
+    fn detect() -> Self {
+        use std::io::IsTerminal;
+        let use_color =
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+        if use_color {
+            Self {
+                path: "\x1b[1;35m",      // bold magenta
+                line_num: "\x1b[32m",     // green
+                heading: "\x1b[36m",      // cyan
+                score: "\x1b[2;33m",      // dim yellow
+                dim: "\x1b[2m",
+                italic_dim: "\x1b[2;3m",
+                reset: "\x1b[0m",
+            }
+        } else {
+            Self {
+                path: "",
+                line_num: "",
+                heading: "",
+                score: "",
+                dim: "",
+                italic_dim: "",
+                reset: "",
+            }
+        }
+    }
 }
 
 // ---------------- shared search helper ----------------

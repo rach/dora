@@ -192,11 +192,33 @@ struct SourceState {
     store: Store,
 }
 
+/// Maximum gap between a `search` and a follow-up `multi_get` for the latter to count as
+/// "this is the search result the user/agent acted on." Matches the PRD's 60s window.
+const USE_ATTRIBUTION_WINDOW_SECS: i64 = 60;
+/// Cap on the recent-search ring buffer. Above this, oldest entries get dropped. 64 is
+/// enough headroom for a small handful of concurrent clients with bursty traffic.
+const RECENT_SEARCHES_CAP: usize = 64;
+
+/// In-memory ring buffer of recent searches across all sources/clients. Each entry records
+/// the source, query string, and the set of file paths returned. A subsequent `multi_get`
+/// that reads any of those paths attributes the read back to the most recent matching
+/// search via `Store::mark_used_by_query`. Best-effort — no correctness criticality.
+struct RecentSearch {
+    source: String,
+    query: String,
+    /// Paths in this source returned by the search. Keep as Vec — search results are small.
+    paths: Vec<String>,
+    ts: i64,
+}
+
 struct MultiSourceState {
     sources: HashMap<String, SourceState>,
     /// Stable ordered list of source names — matches insertion order for deterministic
     /// `list_sources` output and predictable cross-source iteration.
     order: Vec<String>,
+    /// Recent searches indexed for use-attribution. Push on every `search` call, scan on
+    /// every `multi_get` call. Bounded by `RECENT_SEARCHES_CAP`.
+    recent_searches: std::collections::VecDeque<RecentSearch>,
 }
 
 #[derive(Clone)]
@@ -407,6 +429,17 @@ async fn handle_search(
         None => search_cross(multi, &args.query, opts.clone())
             .map_err(|e| ErrorData::internal_error(format!("cross-source search failed: {e}"), None))?,
     };
+
+    // Stash this search in the ring buffer so a subsequent `multi_get` can attribute reads
+    // back to it. Each `Hit` already knows its source name (set by `search::search`); we
+    // group by that so cross-source searches still attribute correctly.
+    let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
+    for h in &hits {
+        by_source.entry(h.source.clone()).or_default().push(h.path.clone());
+    }
+    for (src, paths) in by_source {
+        multi.record_search(&src, &args.query, paths);
+    }
 
     let json = serde_json::to_string(&hits)
         .map_err(|e| ErrorData::internal_error(format!("serialize hits: {e}"), None))?;
@@ -740,15 +773,16 @@ async fn handle_multi_get(
     let args: MultiGetArgs = parse_args(request)?;
     let max_bytes = args.max_bytes.unwrap_or(102_400) as usize;
 
-    let guard = state
+    let mut guard = state
         .lock()
         .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
-    let s = guard.sources.get(&args.source).ok_or_else(|| {
+    let multi = &mut *guard;
+    let s = multi.sources.get(&args.source).ok_or_else(|| {
         ErrorData::invalid_params(
             format!(
                 "unknown source '{}'. registered: {}",
                 args.source,
-                guard.order.join(", ")
+                multi.order.join(", ")
             ),
             None,
         )
@@ -783,6 +817,11 @@ async fn handle_multi_get(
             truncated,
         });
     }
+
+    // Attribute these reads back to any recent in-window search that returned them. For
+    // each read path, find the most recent matching `RecentSearch` and patch the usage row.
+    attribute_reads(multi, &args.source, &entries);
+
     let result = MultiGetResult {
         source: args.source,
         pattern: args.pattern,
@@ -791,6 +830,62 @@ async fn handle_multi_get(
     let json = serde_json::to_string(&result)
         .map_err(|e| ErrorData::internal_error(format!("serialize: {e}"), None))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// For each entry read by a `multi_get` call, scan the ring buffer for the most recent
+/// in-window search (same source) whose results included that path. If found, look up the
+/// chunk_id of the path in the source's index and patch the matching `usage` row's
+/// `used_chunk_id`. Best-effort: any failure here just means the read goes unattributed.
+fn attribute_reads(multi: &mut MultiSourceState, source: &str, entries: &[MultiGetEntry]) {
+    let cutoff = now_secs() - USE_ATTRIBUTION_WINDOW_SECS;
+    // Drop expired entries first so the scan is bounded.
+    while let Some(front) = multi.recent_searches.front() {
+        if front.ts < cutoff {
+            multi.recent_searches.pop_front();
+        } else {
+            break;
+        }
+    }
+    let Some(s) = multi.sources.get(source) else {
+        return;
+    };
+    for entry in entries {
+        // Walk newest-first so we always attribute to the most recent matching search.
+        let matching = multi
+            .recent_searches
+            .iter()
+            .rev()
+            .find(|rs| rs.source == source && rs.paths.iter().any(|p| p == &entry.path));
+        let Some(rs) = matching else { continue };
+        // Resolve chunk_id for this path. multi_get returns whole files; the search returned
+        // chunks. Pick the first chunk of the file as the canonical "this is what was read"
+        // attribution — good enough for v0.7's signal collection (we're learning at the
+        // file level anyway, since the user/agent always reads whole files via multi_get).
+        let chunk_id = match chunk_id_for_path(&s.store, &entry.path) {
+            Ok(Some(id)) => id,
+            _ => continue,
+        };
+        if let Err(err) = s.store.mark_used_by_query(
+            &rs.query,
+            chunk_id,
+            USE_ATTRIBUTION_WINDOW_SECS,
+        ) {
+            eprintln!("dora mcp: mark_used_by_query failed: {err}");
+        }
+    }
+}
+
+fn chunk_id_for_path(store: &Store, path: &str) -> Result<Option<i64>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id \
+         WHERE f.path = ? ORDER BY c.chunk_idx LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![path])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get::<_, i64>(0)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn search_one(
@@ -1001,6 +1096,7 @@ fn build_state(sources: &[Source]) -> Result<MultiSourceState> {
     Ok(MultiSourceState {
         sources: map,
         order,
+        recent_searches: std::collections::VecDeque::new(),
     })
 }
 
@@ -1050,8 +1146,35 @@ impl Default for MultiSourceState {
         Self {
             sources: HashMap::new(),
             order: Vec::new(),
+            recent_searches: std::collections::VecDeque::new(),
         }
     }
+}
+
+impl MultiSourceState {
+    /// Push a fresh search into the ring buffer, dropping the oldest entry once we exceed
+    /// the cap. Called from `handle_search` after a successful search.
+    fn record_search(&mut self, source: &str, query: &str, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.recent_searches.push_back(RecentSearch {
+            source: source.to_string(),
+            query: query.to_string(),
+            paths,
+            ts: now_secs(),
+        });
+        while self.recent_searches.len() > RECENT_SEARCHES_CAP {
+            self.recent_searches.pop_front();
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Server-level `instructions` shown to MCP clients (Claude Code/Cursor/Codex) on initialize.

@@ -280,15 +280,34 @@ dora's incremental indexing means re-running `dora index` is cheap. Queries also
 ├── deep/folder/...
 └── .dora/                 ← dora writes here only (gitignorable)
     ├── index.db           ← local SQLite database with the search index
-    └── models/            ← downloaded ML model (~80 MB, one time)
+    └── models/            ← downloaded ML model (~33 MB, one time)
 
 ~/.config/dora/
 └── registry.toml          ← list of folders you've registered
 ```
 
-**Indexing.** dora reads each `.md` file, splits it into chunks (respecting headings, code blocks, tables), generates a vector embedding per chunk using a small local ML model (default: BGE-small, ~80 MB ONNX file that runs on your laptop). Stores everything in SQLite.
+### Retrieval pipeline
 
-**Searching.** When you query, dora embeds the query the same way, then runs three searches in parallel: a keyword-based one (BM25 / FTS5), a vector-similarity one, and a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`). It merges the three ranked lists with Reciprocal Rank Fusion. You get the top N results back.
+```mermaid
+flowchart TD
+    Q["User query"] --> FTS["FTS5 + heading-path<br/>(BM25)"]
+    Q --> ANN["Vector ANN<br/>(local ONNX embedder)"]
+    Q --> LIT["Literal substring<br/>(camelCase, snake_case,<br/>magic constants)"]
+    ANN --> PRF["PRF arm<br/>top-10 vector hits →<br/>corpus tokens → FTS5"]
+    FTS --> RRF["Reciprocal Rank Fusion<br/>Σ 1/(60+rank)<br/>+ rank-1 bonus +0.05<br/>+ rank-2/3 bonus +0.02"]
+    ANN --> RRF
+    LIT --> RRF
+    PRF --> RRF
+    RRF --> COL["Per-file collapse<br/>+ min_score / top_k"]
+    COL --> OUT["Ranked hits<br/>(MCP / CLI / JSON)"]
+    COL -. best-effort .-> LOG[("usage table<br/>(query, embedding,<br/>returned chunks)<br/>→ v0.7 signal rerank")]
+```
+
+**Indexing.** dora reads each `.md` file, splits it into chunks (respecting headings, code blocks, tables), generates a vector embedding per chunk using a small local ML model (default: a quantized BGE-base, ~33 MB ONNX file that runs on your laptop). Stores everything in SQLite alongside an FTS5 index.
+
+**Searching.** When you query, dora embeds the query the same way, then runs four searches in parallel: a keyword-based one (BM25 / FTS5 over the chunk content + heading path), a vector-similarity one, a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`), and a pseudo-relevance feedback arm (the top vector hits' most-frequent non-stopword tokens become a second FTS5 query — closes vocabulary gaps without an LLM). All four ranked lists merge via Reciprocal Rank Fusion. You get the top N results back.
+
+**Usage logging.** Every search records its query and returned chunk IDs to a local `usage` table — data-collection-only in v0.6, the input for v0.7's signal-based reranker and v0.9's in-process LoRA fine-tuning. No telemetry leaves your machine.
 
 **Incremental.** After the first index, only changed files get re-embedded. Detected via mtime + content hash. Renames are detected and don't re-embed. Even on a vault with 2,500+ chunks (e.g. the Rust Book), a no-op re-index takes about 130 milliseconds.
 

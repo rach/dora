@@ -1,6 +1,6 @@
 [package]
 name = "dora-fs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Personal semantic memory for notes and code — single Rust binary, tree-sitter code chunking, MCP-first."
 license = "MIT"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 rusqlite   = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
-fastembed  = "4"
+fastembed  = "5"
 walkdir    = "2"
 clap       = { version = "4", features = ["derive"] }
 serde      = { version = "1", features = ["derive"] }

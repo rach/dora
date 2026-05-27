@@ -1,4 +1,5 @@
-//! Hybrid search: FTS5 + sqlite-vec ANN merged with Reciprocal Rank Fusion.
+//! Hybrid search: FTS5 + sqlite-vec ANN + literal substring + pseudo-relevance feedback,
+//! merged with Reciprocal Rank Fusion.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -14,8 +15,21 @@ use crate::store::Store;
 const RRF_K: f64 = 60.0;
 const PER_LIST_LIMIT: usize = 50;
 
+/// v0.6 PRF (pseudo-relevance feedback) constants. Tuned blind; the eval harness drives
+/// further tuning if it matters. The vector ANN arm is presumed to be the best proxy for
+/// "what the corpus is talking about for this query", so we mine its top hits for
+/// vocabulary that overlaps with the corpus but doesn't yet appear in the query.
+const PRF_ANN_TOP: usize = 10;
+const PRF_MAX_TERMS: usize = 5;
+const PRF_MIN_TERM_LEN: usize = 3;
+
 #[derive(Debug, Serialize)]
 pub struct Hit {
+    /// Stable id of the chunk in this source's index. Exposed so the MCP layer (or agents
+    /// running follow-up tools) can attribute reads back to the search that returned them,
+    /// and so the v0.6 `usage` log can carry the actual chunk IDs (not paths) for v0.7's
+    /// signal-based reranker.
+    pub chunk_id: i64,
     /// Name of the registered source this hit came from. Set to the source's registry name
     /// in multi-source MCP mode, or to the cwd basename / `--source` argument otherwise.
     pub source: String,
@@ -106,7 +120,36 @@ pub fn search(
             })
     };
 
-    let merged = rrf_merge_n(&[&fts, &ann, &literal]);
+    // Fourth arm: pseudo-relevance feedback. Use the embedder's top chunks as a
+    // corpus-side "expansion dictionary" — the most-frequent non-stopword, non-query-word
+    // tokens become a fresh FTS query. Closes vocabulary gaps without an LLM. PRF is
+    // always-on; bad expansions get drowned by RRF. `DORA_DISABLE_PRF=1` is an eval-only
+    // escape hatch so `scripts/eval.sh` can A/B baseline-vs-PRF on the same binary.
+    let prf_enabled = std::env::var("DORA_DISABLE_PRF")
+        .map(|v| v != "1")
+        .unwrap_or(true);
+    let prf_terms = if prf_enabled {
+        compute_prf_terms(store, &ann, query, PRF_MAX_TERMS)
+    } else {
+        Vec::new()
+    };
+    let prf = if prf_terms.is_empty() {
+        Vec::new()
+    } else {
+        let prf_query = prf_terms
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        store
+            .search_fts(&prf_query, PER_LIST_LIMIT, opts.path_prefix)
+            .unwrap_or_else(|err| {
+                eprintln!("prf query failed (continuing without it): {err}");
+                Vec::new()
+            })
+    };
+
+    let merged = rrf_merge_n(&[&fts, &ann, &literal, &prf]);
     // Per-file collapse: best chunk per file. When `all` is set we keep every collapsed
     // hit and let `min_score` do the filtering downstream; otherwise we still cap at top_k.
     let collapse_cap = if opts.all { merged.len() } else { opts.top_k };
@@ -134,6 +177,7 @@ pub fn search(
             let line = line_for_byte(source_root, Path::new(&chunk.path), chunk.start_byte);
             let context = store.context_for(&chunk.path).ok().flatten();
             hits.push(Hit {
+                chunk_id,
                 source: source_name.to_string(),
                 path: chunk.path,
                 line,
@@ -154,6 +198,15 @@ pub fn search(
             h.heading_path.clear();
             h.snippet.clear();
         }
+    }
+
+    // Best-effort usage logging. The MCP layer's ring buffer + `mark_used_by_query` patches
+    // `used_chunk_id` if a follow-up `multi_get` reads one of the returned paths within 60s.
+    // CLI-only invocations never get attributed, which is fine for v0.6 (data-collection).
+    let chunk_ids: Vec<i64> = hits.iter().map(|h| h.chunk_id).collect();
+    let json = serde_json::to_string(&chunk_ids).unwrap_or_default();
+    if let Err(err) = store.log_usage(query, &query_vec, &json) {
+        eprintln!("dora: usage logging failed (continuing): {err}");
     }
 
     Ok(hits)
@@ -208,7 +261,84 @@ fn rrf_merge_n(lists: &[&[i64]]) -> Vec<(i64, f64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::rrf_merge_n;
+    use super::{compute_prf_terms, rrf_merge_n};
+    use crate::store::{ChunkRow, Store, init_sqlite_vec};
+    use tempfile::tempdir;
+
+    /// PRF must surface vocabulary-adjacent terms from the corpus while filtering out
+    /// stopwords and any token already in the user's query.
+    #[test]
+    fn prf_terms_excludes_stopwords_and_query_words() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("p.db");
+        let mut store = Store::open(&db, 4).unwrap();
+
+        // Seed two chunks talking about "lead scoring" / "GTM signals" — vocabulary the
+        // user's "ICP tracking" query does NOT contain. We want PRF to surface those.
+        let emb = vec![0.0f32, 0.0, 0.0, 0.0];
+        let rows = vec![
+            ChunkRow {
+                idx: 0,
+                heading_path: "",
+                content: "Lead scoring requires a clear ICP model. The signals are: \
+                          firmographic, demographic, behavioral. Scoring is iterative.",
+                start_byte: 0,
+                end_byte: 200,
+                embedding: &emb,
+                kind: "prose",
+                symbol: None,
+                parent_chunk_idx: None,
+            },
+            ChunkRow {
+                idx: 1,
+                heading_path: "",
+                content: "GTM motion: outbound prospecting against your ICP. Use \
+                          firmographic signals to prioritize accounts. Scoring matters.",
+                start_byte: 200,
+                end_byte: 400,
+                embedding: &emb,
+                kind: "prose",
+                symbol: None,
+                parent_chunk_idx: None,
+            },
+        ];
+        store
+            .upsert_file_with_chunks("notes.md", 1, 400, "hash", &rows, &[])
+            .unwrap();
+
+        let ann_ids = vec![1i64, 2i64];
+        let query = "how to track ICP";
+        let terms = compute_prf_terms(&store, &ann_ids, query, 5);
+
+        // ICP is in the query → excluded. Stopwords ("the", "to", "your") → excluded.
+        for t in &terms {
+            assert_ne!(t, "icp", "query word must not be in PRF expansion");
+            assert_ne!(t, "the", "stopword must not be in PRF expansion");
+            assert_ne!(t, "to", "stopword must not be in PRF expansion");
+        }
+        // "scoring" appears 3× across both chunks → should be a top expansion term.
+        assert!(
+            terms.iter().any(|t| t == "scoring"),
+            "expected 'scoring' in PRF terms, got {terms:?}"
+        );
+        // "signals" appears 2× and isn't a stopword → expect it too.
+        assert!(
+            terms.iter().any(|t| t == "signals"),
+            "expected 'signals' in PRF terms, got {terms:?}"
+        );
+        assert!(terms.len() <= 5, "PRF respects max-terms cap");
+    }
+
+    #[test]
+    fn prf_terms_empty_when_no_ann_hits() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("p2.db");
+        let store = Store::open(&db, 4).unwrap();
+        let terms = compute_prf_terms(&store, &[], "anything", 5);
+        assert!(terms.is_empty(), "no ANN hits → no PRF terms");
+    }
 
     #[test]
     fn rank_one_in_any_list_gets_bonus() {
@@ -303,3 +433,81 @@ fn line_for_byte(vault_root: &Path, rel_path: &Path, start_byte: usize) -> usize
     let cap = start_byte.min(bytes.len());
     bytes[..cap].iter().filter(|b| **b == b'\n').count() + 1
 }
+
+/// Pseudo-relevance feedback term mining. Pulls the top vector-ANN chunks (the embedder's
+/// best guess at "what's the corpus talking about for this query"), word-counts their
+/// content, drops stopwords + query-words + short tokens, and returns the top-`max` by
+/// frequency. The result is a small set of corpus vocabulary likely to be relevant — fed
+/// into FTS as a fourth `rrf_merge_n` arm to close vocabulary gaps without an LLM.
+fn compute_prf_terms(store: &Store, ann_ids: &[i64], query: &str, max: usize) -> Vec<String> {
+    let top = ann_ids
+        .iter()
+        .take(PRF_ANN_TOP)
+        .copied()
+        .collect::<Vec<_>>();
+    if top.is_empty() || max == 0 {
+        return Vec::new();
+    }
+    let query_words: HashSet<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(|s| {
+            s.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for id in &top {
+        let Some(chunk) = store.fetch_chunk(*id).ok().flatten() else {
+            continue;
+        };
+        for raw in chunk.content.split_whitespace() {
+            let w: String = raw
+                .to_lowercase()
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string();
+            if w.len() < PRF_MIN_TERM_LEN
+                || query_words.contains(&w)
+                || STOPWORDS.contains(&w.as_str())
+                || !w.chars().any(|c| c.is_alphabetic())
+            {
+                continue;
+            }
+            *freq.entry(w).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(String, usize)> = freq.into_iter().collect();
+    // Sort by frequency desc, then alphabetic asc for deterministic results when frequencies tie.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.into_iter().take(max).map(|(w, _)| w).collect()
+}
+
+/// English stopwords for PRF. ~200 of the most-frequent function words — enough to keep PRF
+/// from regressing to "the, and, of" while staying small enough to compile in. The corpus
+/// is overwhelmingly English in practice; if non-English corpora become a thing we'll add
+/// per-language lists keyed off the source's configured language.
+const STOPWORDS: &[&str] = &[
+    "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and",
+    "any", "are", "aren", "as", "at", "back", "be", "because", "been", "before", "being",
+    "below", "between", "both", "but", "by", "can", "come", "could", "couldn", "day",
+    "did", "didn", "do", "does", "doesn", "doing", "don", "down", "during", "each",
+    "either", "end", "even", "every", "few", "first", "for", "from", "further", "get",
+    "give", "go", "going", "good", "got", "had", "hadn", "has", "hasn", "have", "haven",
+    "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how",
+    "however", "i", "if", "in", "into", "is", "isn", "it", "its", "itself", "just",
+    "know", "last", "left", "let", "like", "look", "made", "make", "making", "many",
+    "may", "me", "might", "more", "most", "mustn", "my", "myself", "need", "needs",
+    "new", "no", "nor", "not", "now", "of", "off", "on", "once", "one", "only", "or",
+    "other", "others", "our", "ours", "ourselves", "out", "over", "own", "part",
+    "people", "put", "rather", "really", "right", "said", "same", "say", "see", "seen",
+    "set", "shall", "shan", "she", "should", "shouldn", "show", "since", "so", "some",
+    "still", "such", "take", "taken", "than", "that", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "these", "they", "thing", "things", "this", "those",
+    "though", "through", "thus", "time", "to", "too", "two", "under", "until", "up",
+    "upon", "us", "use", "used", "uses", "using", "very", "via", "want", "wants", "was",
+    "wasn", "way", "ways", "we", "well", "were", "weren", "what", "when", "where",
+    "whether", "which", "while", "who", "whom", "whose", "why", "will", "with", "within",
+    "without", "won", "would", "wouldn", "yes", "yet", "you", "your", "yours", "yourself",
+    "yourselves",
+];
