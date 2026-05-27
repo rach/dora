@@ -718,6 +718,11 @@ fn cmd_search(
         } else {
             println!("{}:{}: [{}] {}", h.path, h.line, h.heading_path, h.snippet);
         }
+        if let Some(ctx) = h.context.as_deref() {
+            // Indented continuation so the path:line column stays scannable. Only renders
+            // when the user registered a context for this path's subtree.
+            println!("       context: {ctx}");
+        }
     }
     Ok(())
 }

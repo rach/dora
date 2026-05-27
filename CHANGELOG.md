@@ -4,6 +4,20 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-26
+
+### Changed
+
+- Per-subpath context strings now also surface in the **default text output** of
+  `dora "<query>"`, not just `--json` / MCP. Each hit whose path is under a
+  registered context prefix gets an indented continuation line:
+  ```
+  technology/Foo.md:1: [section] snippet…
+         context: Engineering and design nuggets
+  ```
+  Closes a gap where v0.4.0's docs claimed context surfaces "on every matching
+  hit" but the bare-CLI text path was dropping it. JSON + MCP behavior unchanged.
+
 ## [0.4.0] — 2026-05-26
 
 ### Added
