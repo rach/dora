@@ -111,6 +111,11 @@ Notes mode uses a smaller toolset — `search` does most of the work.
 - **Frontmatter-only notes** (kepano spec sheets: movies, books, places, contacts) look empty in
   grep but dora synthesizes the YAML into prose. They ARE searchable — don't tell the user
   "nothing matched" if you only checked the body.
+- **"What links to this note?" / navigating a vault structurally** → `mcp__dora__backlinks({source, path})`
+  returns inbound + outbound wikilinks (built from `[[wikilinks]]` and `[text](note.md)` at
+  index time). Use this on Obsidian-style vaults whenever the user asks about relationships
+  between notes ("what references the fundraising memo?"), or to discover the neighborhood
+  of a note you just found via `search`.
 
 ## Step 4 — anti-patterns (when NOT to use dora)
 
@@ -127,16 +132,24 @@ full file context, then `Edit`. Don't force every step through dora.
 
 ## Tool reference
 
-All seven tools are exposed as `mcp__dora__<name>`:
+All eight tools are exposed as `mcp__dora__<name>`:
 
-- `search(query, source?, top_k=10, path_prefix?, min_score?, all?, output?)` — hybrid
-  FTS5 + vector + literal-substring, merged via RRF. Omit `source` for cross-source search.
-  v0.4 args:
+- `search(query, source?, top_k=10, path_prefix?, min_score?, all?, output?, and?, not?)` —
+  hybrid FTS5 + vector + literal-substring + PRF, merged via RRF, with an optional graph-PPR
+  boost on top. Omit `source` for cross-source search.
   - `min_score: number` — drop hits below this RRF threshold. Pair with `all: true` for
     "every relevant doc above this confidence" flows.
   - `all: true` — drop the top_k cap, return every hit that passed `min_score`.
   - `output: "files"` — dedupe hits by path, one entry per file (no snippet/line). Pairs
     with `all: true` to enumerate every matching file in the corpus.
+  - **`and: ["term", …]` (v0.7)** — intersection. A chunk must score for the primary query
+    AND every entry to remain a result; combined score is the harmonic mean of normalized
+    per-query scores. Reach for it to narrow a too-broad result, e.g.
+    `search({query:"authentication", and:["rate limiting"]})` returns chunks about both.
+  - **`not: ["term", …]` (v0.7)** — exclusion. Chunks scoring highly on any entry are
+    dropped; weaker matches get a soft demote. Reach for it to filter out a known
+    distractor, e.g. `search({query:"caching", not:["Redis"]})`. Both arrays are
+    repeatable and compose.
   Each hit may carry a `context` field — a user-attached description of the subtree the
   path lives under (set via `dora context add`). Surface it in your reply when present.
 - `list_sources()` — every registered source with name, description, path, embedder id, file +
@@ -152,6 +165,10 @@ All seven tools are exposed as `mcp__dora__<name>`:
   (e.g. `src/**/*.rs`, `notes/2026-*.md`) relative to the source root. Returns body text per
   match; files larger than `max_bytes` are truncated and flagged. Use this instead of N×Read
   when you already know which files you want.
+- **`backlinks(source, path)` (v0.7)** — inbound + outbound wikilinks for a note. Built from
+  `[[wikilinks]]` and `[text](note.md)` at index time; resolved by note title/path. Returns
+  `{inbound: [...], outbound: [...]}` of source-root-relative note paths. Use to navigate a
+  vault structurally ("what references this?") or to discover related notes after a `search`.
 
 ## Performance — HTTP daemon
 
