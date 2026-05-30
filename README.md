@@ -302,7 +302,6 @@ flowchart TD
     PPR --> BOOL["Boolean overlay<br/>--and: harmonic-mean intersect<br/>--not: hard-drop + soft-demote"]
     BOOL --> COL["Per-file collapse<br/>+ min_score / top_k"]
     COL --> OUT["Ranked hits<br/>(MCP / CLI / JSON)"]
-    COL -. best-effort .-> LOG[("usage table<br/>(query, embedding,<br/>returned chunks)<br/>→ future signal rerank")]
 ```
 
 ### Choosing an embedder
