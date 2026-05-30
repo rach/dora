@@ -15,6 +15,17 @@ use crate::store::Store;
 const RRF_K: f64 = 60.0;
 const PER_LIST_LIMIT: usize = 50;
 
+/// v0.10 graph-PPR retrieval (Layer C). Seed PPR with the top-`GRAPH_SEED_TOPK` RRF hits;
+/// add at most `GRAPH_BOOST_CAP` to a candidate's score, scaled by its normalized PPR mass.
+/// The cap is tie-breaker-scale (RRF top scores are ~0.05–0.15 and the rank bonuses are
+/// 0.02–0.05): the graph nudges ordering among near-tied hits and promotes graph-central
+/// candidates, but can't bulldoze a strong lexical/vector match. Keeps the boost net-positive
+/// on associative/linked corpora without regressing single-hop retrieval on flat ones.
+const GRAPH_SEED_TOPK: usize = 10;
+const GRAPH_BOOST_CAP: f64 = 0.03;
+const GRAPH_PPR_ITERATIONS: usize = 30;
+const GRAPH_PPR_DAMPING: f64 = 0.85;
+
 /// v0.6 PRF (pseudo-relevance feedback) constants. Tuned blind; the eval harness drives
 /// further tuning if it matters. The vector ANN arm is presumed to be the best proxy for
 /// "what the corpus is talking about for this query", so we mine its top hits for
@@ -57,6 +68,13 @@ pub struct SearchOptions<'a> {
     pub all: bool,
     pub path_prefix: Option<&'a str>,
     pub output: OutputMode,
+    /// Boolean intersection terms (`--and` on CLI, `and` on the MCP `search` tool). A chunk
+    /// must score above zero on the primary AND every and-query to remain a candidate; final
+    /// score is the harmonic mean of the per-query normalized scores. Empty = no intersection.
+    pub and_queries: Vec<String>,
+    /// Boolean exclusion terms (`--not` / `not`). Chunks scoring highly on any not-query are
+    /// dropped; weaker matches get a soft demote. Empty = no exclusion.
+    pub not_queries: Vec<String>,
 }
 
 impl<'a> Default for SearchOptions<'a> {
@@ -67,6 +85,8 @@ impl<'a> Default for SearchOptions<'a> {
             all: false,
             path_prefix: None,
             output: OutputMode::Chunks,
+            and_queries: Vec::new(),
+            not_queries: Vec::new(),
         }
     }
 }
@@ -89,67 +109,41 @@ pub fn search(
     source_name: &str,
     opts: SearchOptions<'_>,
 ) -> Result<Vec<Hit>> {
-    let query_vec = embedder.embed_one(query)?;
-    let ann = store.search_ann(&query_vec, PER_LIST_LIMIT, opts.path_prefix)?;
+    // Primary hybrid pass: 4-arm RRF over the user's query. `query_vec` is kept for
+    // usage logging downstream.
+    let (mut merged, query_vec) = compute_merged(query, store, embedder, opts.path_prefix)?;
 
-    let fts_query = safe_fts_query(query);
-    let fts = if fts_query.is_empty() {
-        Vec::new()
-    } else {
-        store
-            .search_fts(&fts_query, PER_LIST_LIMIT, opts.path_prefix)
-            .unwrap_or_else(|err| {
-                eprintln!("fts query failed (continuing with ANN only): {err}");
-                Vec::new()
-            })
-    };
-
-    // Third arm: literal substring scan. Closes the gaps where FTS5's tokenizer doesn't
-    // help — camelCase identifiers (`processRequest`), snake_case fragments (`foo_bar`),
-    // magic constants (`E_NOENT`). For natural-language queries this typically returns
-    // nothing (or noise that RRF discounts to the bottom), so it never hurts.
-    let trimmed_query = query.trim();
-    let literal = if trimmed_query.is_empty() {
-        Vec::new()
-    } else {
-        store
-            .search_literal(trimmed_query, PER_LIST_LIMIT, opts.path_prefix)
-            .unwrap_or_else(|err| {
-                eprintln!("literal query failed (continuing without it): {err}");
-                Vec::new()
-            })
-    };
-
-    // Fourth arm: pseudo-relevance feedback. Use the embedder's top chunks as a
-    // corpus-side "expansion dictionary" — the most-frequent non-stopword, non-query-word
-    // tokens become a fresh FTS query. Closes vocabulary gaps without an LLM. PRF is
-    // always-on; bad expansions get drowned by RRF. `DORA_DISABLE_PRF=1` is an eval-only
-    // escape hatch so `scripts/eval.sh` can A/B baseline-vs-PRF on the same binary.
-    let prf_enabled = std::env::var("DORA_DISABLE_PRF")
+    // Layer C: Personalized-PageRank graph boost. Seed PPR with the current top hits
+    // (weighted by RRF score), spread across the document graph (wikilinks + derived
+    // edges), and add a bounded boost so chunks densely connected to the seed surface —
+    // associative recall without an LLM. Applied to the FULL merged list (before collapse)
+    // so a graph-central chunk can climb into top_k, not just reorder the already-top-k.
+    // Composes additively with the planned v0.7 usage boost. Gated on the source having a
+    // graph; `DORA_DISABLE_GRAPH=1` is an eval-only A/B switch. Primary-query only — side
+    // queries (--and / --not) don't propagate graph drift.
+    let graph_enabled = std::env::var("DORA_DISABLE_GRAPH")
         .map(|v| v != "1")
         .unwrap_or(true);
-    let prf_terms = if prf_enabled {
-        compute_prf_terms(store, &ann, query, PRF_MAX_TERMS)
+    if graph_enabled && !merged.is_empty() {
+        apply_graph_boost(store, &mut merged);
+    }
+
+    // Boolean overlay: --and intersects (harmonic mean of normalized scores), --not
+    // hard-drops + soft-demotes. Each side query runs the same compute_merged pipeline
+    // (no graph boost, by design). No-op when both lists are empty — backward-compatible.
+    let merged = if opts.and_queries.is_empty() && opts.not_queries.is_empty() {
+        merged
     } else {
-        Vec::new()
-    };
-    let prf = if prf_terms.is_empty() {
-        Vec::new()
-    } else {
-        let prf_query = prf_terms
-            .iter()
-            .map(|t| format!("\"{t}\""))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        store
-            .search_fts(&prf_query, PER_LIST_LIMIT, opts.path_prefix)
-            .unwrap_or_else(|err| {
-                eprintln!("prf query failed (continuing without it): {err}");
-                Vec::new()
-            })
+        apply_boolean(
+            merged,
+            &opts.and_queries,
+            &opts.not_queries,
+            store,
+            embedder,
+            opts.path_prefix,
+        )?
     };
 
-    let merged = rrf_merge_n(&[&fts, &ann, &literal, &prf]);
     // Per-file collapse: best chunk per file. When `all` is set we keep every collapsed
     // hit and let `min_score` do the filtering downstream; otherwise we still cap at top_k.
     let collapse_cap = if opts.all { merged.len() } else { opts.top_k };
@@ -210,6 +204,222 @@ pub fn search(
     }
 
     Ok(hits)
+}
+
+/// One pass of dora's 4-arm hybrid pipeline (FTS + ANN + literal + PRF, fused via RRF).
+/// Returns the merged ranked list **without** the Layer-C graph boost and **without**
+/// per-file collapse / min_score / top_k truncation — those are the caller's concern. The
+/// query's embedding is returned too so the caller can reuse it (usage logging, etc.)
+/// without re-running the embedder.
+///
+/// Used by `search()` for the user's primary query and by `apply_boolean` for each `--and`
+/// / `--not` side query, so all queries share identical ranking semantics.
+fn compute_merged(
+    query: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    path_prefix: Option<&str>,
+) -> Result<(Vec<(i64, f64)>, Vec<f32>)> {
+    let query_vec = embedder.embed_one(query)?;
+    let ann = store.search_ann(&query_vec, PER_LIST_LIMIT, path_prefix)?;
+
+    let fts_query = safe_fts_query(query);
+    let fts = if fts_query.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .search_fts(&fts_query, PER_LIST_LIMIT, path_prefix)
+            .unwrap_or_else(|err| {
+                eprintln!("fts query failed (continuing with ANN only): {err}");
+                Vec::new()
+            })
+    };
+
+    let trimmed_query = query.trim();
+    let literal = if trimmed_query.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .search_literal(trimmed_query, PER_LIST_LIMIT, path_prefix)
+            .unwrap_or_else(|err| {
+                eprintln!("literal query failed (continuing without it): {err}");
+                Vec::new()
+            })
+    };
+
+    let prf_enabled = std::env::var("DORA_DISABLE_PRF")
+        .map(|v| v != "1")
+        .unwrap_or(true);
+    let prf_terms = if prf_enabled {
+        compute_prf_terms(store, &ann, query, PRF_MAX_TERMS)
+    } else {
+        Vec::new()
+    };
+    let prf = if prf_terms.is_empty() {
+        Vec::new()
+    } else {
+        let prf_query = prf_terms
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        store
+            .search_fts(&prf_query, PER_LIST_LIMIT, path_prefix)
+            .unwrap_or_else(|err| {
+                eprintln!("prf query failed (continuing without it): {err}");
+                Vec::new()
+            })
+    };
+
+    Ok((rrf_merge_n(&[&fts, &ann, &literal, &prf]), query_vec))
+}
+
+/// Personalized-PageRank boost over the document graph. Seeds PPR with the merged top hits
+/// (weighted by RRF score), runs it over the source's wikilink + derived-edge graph, and adds
+/// a bounded boost to each candidate by its normalized PPR mass. Re-ranks the candidate pool
+/// in place. No-op (silent) when the source has no graph. Composes additively with future
+/// boosts (e.g. v0.7 usage signal) since the boost is capped.
+fn apply_graph_boost(store: &Store, merged: &mut Vec<(i64, f64)>) {
+    let edges = match store.graph_edges_for_ppr() {
+        Ok(e) if !e.is_empty() => e,
+        _ => return,
+    };
+    let mut seed: HashMap<i64, f64> = HashMap::new();
+    for (id, score) in merged.iter().take(GRAPH_SEED_TOPK) {
+        seed.insert(*id, *score);
+    }
+    if seed.is_empty() {
+        return;
+    }
+    let ppr = crate::pagerank::compute_ppr(
+        &edges,
+        &seed,
+        GRAPH_PPR_ITERATIONS,
+        GRAPH_PPR_DAMPING,
+    );
+    let max_ppr = ppr.values().copied().fold(0.0f64, f64::max);
+    if max_ppr <= 0.0 {
+        return;
+    }
+    for (id, score) in merged.iter_mut() {
+        if let Some(mass) = ppr.get(id) {
+            *score += GRAPH_BOOST_CAP * (mass / max_ppr);
+        }
+    }
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+/// `--not` thresholds. A candidate with not-score above `NOT_HARD_DROP` is removed entirely
+/// ("it's really about Z"); softer matches get `NOT_ALPHA * not_score` subtracted from their
+/// running score (gentle demote). Combined: "demote, and drop the obvious cases."
+const NOT_HARD_DROP: f64 = 0.5;
+const NOT_ALPHA: f64 = 0.5;
+
+/// Boolean overlay on a hybrid-search result. For each `--and` query, runs the same
+/// `compute_merged` pipeline, normalizes scores to [0,1], and intersects: a chunk must
+/// appear in the primary AND every and-list to survive, with combined score = harmonic mean
+/// across all lists (asymmetry is punished). For each `--not` query, runs the same pipeline,
+/// drops candidates that score highly, and subtracts a fraction of softer matches' scores.
+///
+/// All side queries skip the Layer-C graph boost on purpose — the graph represents the
+/// PRIMARY intent; we don't want exclusion or intersection terms to propagate through it.
+fn apply_boolean(
+    primary: Vec<(i64, f64)>,
+    and_queries: &[String],
+    not_queries: &[String],
+    store: &Store,
+    embedder: &dyn Embedder,
+    path_prefix: Option<&str>,
+) -> Result<Vec<(i64, f64)>> {
+    let mut primary = primary;
+    normalize_scores(&mut primary);
+
+    // Build the per-and lookup tables (normalized).
+    let and_maps: Vec<HashMap<i64, f64>> = and_queries
+        .iter()
+        .filter(|q| {
+            let trimmed = q.trim().is_empty();
+            if trimmed {
+                eprintln!("dora: skipping empty --and term");
+            }
+            !trimmed
+        })
+        .map(|q| {
+            let (mut list, _vec) = compute_merged(q, store, embedder, path_prefix)?;
+            normalize_scores(&mut list);
+            Ok(list.into_iter().collect())
+        })
+        .collect::<Result<_>>()?;
+
+    // Intersection: drop candidates missing from any and-map; combine via harmonic mean.
+    let mut out: Vec<(i64, f64)> = primary
+        .into_iter()
+        .filter_map(|(id, p_score)| {
+            let mut scores = Vec::with_capacity(and_maps.len() + 1);
+            scores.push(p_score);
+            for m in &and_maps {
+                match m.get(&id) {
+                    Some(v) => scores.push(*v),
+                    None => return None,
+                }
+            }
+            Some((id, harmonic_mean(&scores)))
+        })
+        .collect();
+
+    // Exclusion: per not-query, hard-drop above the threshold, soft-subtract below.
+    for nq in not_queries.iter().filter(|q| {
+        let trimmed = q.trim().is_empty();
+        if trimmed {
+            eprintln!("dora: skipping empty --not term");
+        }
+        !trimmed
+    }) {
+        let (mut list, _vec) = compute_merged(nq, store, embedder, path_prefix)?;
+        normalize_scores(&mut list);
+        let map: HashMap<i64, f64> = list.into_iter().collect();
+        out.retain(|(id, _)| {
+            map.get(id).map(|v| *v <= NOT_HARD_DROP).unwrap_or(true)
+        });
+        for (id, score) in out.iter_mut() {
+            if let Some(v) = map.get(id) {
+                *score -= NOT_ALPHA * v;
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+/// Divide every score by the max so the list is in [0,1]. No-op on empty / all-zero lists.
+fn normalize_scores(list: &mut [(i64, f64)]) {
+    let max = list.iter().map(|(_, s)| *s).fold(0.0f64, f64::max);
+    if max > 0.0 {
+        for (_, s) in list.iter_mut() {
+            *s /= max;
+        }
+    }
+}
+
+/// Harmonic mean of positive scores. Punishes asymmetry: `harmonic_mean(&[0.9, 0.1])`
+/// (≈ 0.18) is much lower than `harmonic_mean(&[0.5, 0.5])` (= 0.5). Returns 0 if any
+/// element is ≤ 0 (a zero score in an intersection means "not a candidate," so the
+/// combined score is zero).
+fn harmonic_mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let mut denom = 0.0f64;
+    for x in xs {
+        if *x <= 0.0 {
+            return 0.0;
+        }
+        denom += 1.0 / *x;
+    }
+    xs.len() as f64 / denom
 }
 
 fn collapse_per_file(
@@ -338,6 +548,37 @@ mod tests {
         let store = Store::open(&db, 4).unwrap();
         let terms = compute_prf_terms(&store, &[], "anything", 5);
         assert!(terms.is_empty(), "no ANN hits → no PRF terms");
+    }
+
+    #[test]
+    fn harmonic_mean_punishes_asymmetry() {
+        // Two chunks with the same arithmetic mean but very different distributions.
+        let asymmetric = super::harmonic_mean(&[0.9, 0.1]);
+        let symmetric = super::harmonic_mean(&[0.5, 0.5]);
+        assert!(
+            asymmetric < symmetric,
+            "expected harmonic_mean(0.9,0.1)={asymmetric} < harmonic_mean(0.5,0.5)={symmetric}"
+        );
+        // Hard zero short-circuits to zero (intersection: a missing list zeroes the chunk).
+        assert_eq!(super::harmonic_mean(&[0.5, 0.0, 0.5]), 0.0);
+        // Single-element list returns that element.
+        assert!((super::harmonic_mean(&[0.42]) - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn normalize_scores_to_unit_interval() {
+        let mut list = vec![(1, 4.0), (2, 2.0), (3, 1.0)];
+        super::normalize_scores(&mut list);
+        assert_eq!(list[0].1, 1.0);
+        assert_eq!(list[1].1, 0.5);
+        assert_eq!(list[2].1, 0.25);
+        // No-op on empty + all-zero lists.
+        let mut empty: Vec<(i64, f64)> = Vec::new();
+        super::normalize_scores(&mut empty);
+        assert!(empty.is_empty());
+        let mut zeros = vec![(1, 0.0), (2, 0.0)];
+        super::normalize_scores(&mut zeros);
+        assert_eq!(zeros, vec![(1, 0.0), (2, 0.0)]);
     }
 
     #[test]
@@ -487,7 +728,7 @@ fn compute_prf_terms(store: &Store, ann_ids: &[i64], query: &str, max: usize) ->
 /// from regressing to "the, and, of" while staying small enough to compile in. The corpus
 /// is overwhelmingly English in practice; if non-English corpora become a thing we'll add
 /// per-language lists keyed off the source's configured language.
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and",
     "any", "are", "aren", "as", "at", "back", "be", "because", "been", "before", "being",
     "below", "between", "both", "but", "by", "can", "come", "could", "couldn", "day",

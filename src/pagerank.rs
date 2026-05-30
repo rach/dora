@@ -123,8 +123,9 @@ pub fn compute(conn: &Connection, focus_paths: &[String]) -> Result<HashMap<i64,
         }
     }
 
-    // Personalization vector. `focus_paths` are matched as prefixes against file paths.
-    let n = file_paths.len() as f64;
+    // Personalization vector over EVERY file: focus_paths get FOCUS_BOOST, the rest 1.0.
+    // Passing all files as seed entries preserves the "row per file" contract (isolated
+    // files still appear) and lets the generic `compute_ppr` engine do the iteration.
     let focus_ids: HashSet<i64> = if focus_paths.is_empty() {
         HashSet::new()
     } else {
@@ -134,46 +135,91 @@ pub fn compute(conn: &Connection, focus_paths: &[String]) -> Result<HashMap<i64,
             .map(|(id, _)| *id)
             .collect()
     };
-    let pers_total: f64 = if focus_ids.is_empty() {
-        n
-    } else {
-        focus_ids.len() as f64 * FOCUS_BOOST + (n - focus_ids.len() as f64)
-    };
-    let personalization = |id: i64| -> f64 {
-        let boost = if focus_ids.contains(&id) {
-            FOCUS_BOOST
+    let seed: HashMap<i64, f64> = file_paths
+        .keys()
+        .map(|id| {
+            let boost = if focus_ids.contains(id) { FOCUS_BOOST } else { 1.0 };
+            (*id, boost)
+        })
+        .collect();
+
+    let edges: Vec<(i64, i64, f64)> = weighted
+        .into_iter()
+        .map(|((s, d), w)| (s, d, w))
+        .collect();
+
+    Ok(compute_ppr(&edges, &seed, ITERATIONS, DAMPING))
+}
+
+/// Generic Personalized PageRank engine — the shared core behind both `repo_map` (file +
+/// symbol graph, seeded by `focus_paths`) and the v0.10 graph-retrieval boost (chunk graph,
+/// seeded by the search's top hits). Node ids are opaque `i64` (file ids or chunk ids).
+///
+/// `edges` are directed `(src, dst, weight)`; `seed` is the personalization vector (need not
+/// be normalized — we normalize internally). Returns a score per node appearing in `edges`
+/// or `seed`. Dangling mass redistributes uniformly (standard Brin/Page treatment).
+pub fn compute_ppr(
+    edges: &[(i64, i64, f64)],
+    seed: &HashMap<i64, f64>,
+    iterations: usize,
+    damping: f64,
+) -> HashMap<i64, f64> {
+    let mut nodes: HashSet<i64> = HashSet::new();
+    for (s, d, _) in edges {
+        nodes.insert(*s);
+        nodes.insert(*d);
+    }
+    for id in seed.keys() {
+        nodes.insert(*id);
+    }
+    if nodes.is_empty() {
+        return HashMap::new();
+    }
+    let n = nodes.len() as f64;
+
+    // Out adjacency, normalized so each node's outgoing weights sum to 1.
+    let mut out_adj: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
+    let mut out_sum: HashMap<i64, f64> = HashMap::new();
+    for (s, d, w) in edges {
+        out_adj.entry(*s).or_default().push((*d, *w));
+        *out_sum.entry(*s).or_insert(0.0) += w;
+    }
+    for (s, es) in out_adj.iter_mut() {
+        let sum = out_sum.get(s).copied().unwrap_or(1.0);
+        if sum > 0.0 {
+            for (_, w) in es.iter_mut() {
+                *w /= sum;
+            }
+        }
+    }
+
+    let seed_total: f64 = seed.values().sum();
+    let pers = |id: i64| -> f64 {
+        if seed_total > 0.0 {
+            seed.get(&id).copied().unwrap_or(0.0) / seed_total
         } else {
-            1.0
-        };
-        boost / pers_total
+            1.0 / n
+        }
     };
 
-    // Initialize uniform; iterate. Sinks (no outgoing edges) leak mass to the whole graph
-    // via the standard "dangling redistribution" trick.
-    let mut rank: HashMap<i64, f64> =
-        file_paths.keys().map(|id| (*id, 1.0 / n)).collect();
-    let damping = DAMPING;
     let teleport = 1.0 - damping;
+    let mut rank: HashMap<i64, f64> = nodes.iter().map(|id| (*id, 1.0 / n)).collect();
 
-    for _ in 0..ITERATIONS {
-        let mut next: HashMap<i64, f64> = HashMap::with_capacity(rank.len());
+    for _ in 0..iterations {
         let dangling_mass: f64 = rank
             .iter()
             .filter(|(id, _)| !out_adj.contains_key(*id))
             .map(|(_, r)| *r)
             .sum();
-        for &id in file_paths.keys() {
-            // Base teleport (personalized).
-            let mut v = teleport * personalization(id);
-            // Dangling mass redistributed uniformly (could also be personalized — keeps it
-            // simple and matches the standard Brin/Page treatment).
+        let mut next: HashMap<i64, f64> = HashMap::with_capacity(rank.len());
+        for &id in &nodes {
+            let mut v = teleport * pers(id);
             v += damping * dangling_mass / n;
             next.insert(id, v);
         }
-        // Add contribution from each source's outgoing distribution.
-        for (src, edges) in &out_adj {
+        for (src, es) in &out_adj {
             let src_rank = rank.get(src).copied().unwrap_or(0.0);
-            for (dst, w) in edges {
+            for (dst, w) in es {
                 if let Some(slot) = next.get_mut(dst) {
                     *slot += damping * src_rank * w;
                 }
@@ -182,7 +228,7 @@ pub fn compute(conn: &Connection, focus_paths: &[String]) -> Result<HashMap<i64,
         rank = next;
     }
 
-    Ok(rank)
+    rank
 }
 
 fn is_real_identifier(s: &str) -> bool {
@@ -204,6 +250,21 @@ fn is_real_identifier(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ppr_concentrates_mass_on_seed_neighborhood() {
+        // Two disjoint triangles. Seed node 1 → mass should pool in {1,2,3}, not {4,5,6}.
+        let edges = vec![
+            (1, 2, 1.0), (2, 3, 1.0), (3, 1, 1.0),
+            (4, 5, 1.0), (5, 6, 1.0), (6, 4, 1.0),
+        ];
+        let mut seed = HashMap::new();
+        seed.insert(1i64, 1.0);
+        let r = compute_ppr(&edges, &seed, 30, 0.85);
+        let near: f64 = [1, 2, 3].iter().map(|i| r[i]).sum();
+        let far: f64 = [4, 5, 6].iter().map(|i| r[i]).sum();
+        assert!(near > far * 3.0, "seed cluster {near} should dominate far cluster {far}");
+    }
 
     #[test]
     fn real_identifier_heuristics() {

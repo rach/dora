@@ -434,6 +434,157 @@ impl Store {
         Ok(resolved as usize)
     }
 
+    /// Pass-2 resolver for authored prose links (`kind='wikilink'`). Unlike code edges
+    /// (resolved by `chunks.symbol`), wikilinks resolve by note title/path: a `[[folder/Note]]`
+    /// or `[text](folder/note.md)` points at the file whose path-suffix or basename matches.
+    /// Resolves to the target note's **chunk 0** (its representative node). Confidence:
+    /// `exact` (unique match), `name_match` (ambiguous — multiple notes same title; first by
+    /// file id is recorded but flagged), or left NULL (dangling — no such note).
+    pub fn resolve_wikilinks(&mut self) -> Result<usize> {
+        // file_id -> path; title(lowercased, no ext) -> file_ids; file_id -> chunk-0 id.
+        let files: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, path FROM files")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+        if files.is_empty() {
+            return Ok(0);
+        }
+        let chunk0: HashMap<i64, i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT file_id, id FROM chunks WHERE chunk_idx = 0")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut out = HashMap::new();
+            for r in rows {
+                let (f, c) = r?;
+                out.insert(f, c);
+            }
+            out
+        };
+        let path_no_ext = |p: &str| p.strip_suffix(".md").unwrap_or(p).to_lowercase();
+        let mut title_map: HashMap<String, Vec<i64>> = HashMap::new();
+        for (fid, path) in &files {
+            let base = std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            title_map.entry(base).or_default().push(*fid);
+        }
+
+        // Unresolved wikilink edges.
+        let edges: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, target_symbol, target_path FROM links \
+                 WHERE kind = 'wikilink' AND target_chunk_id IS NULL",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+        if edges.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut resolved = 0usize;
+        for (link_id, title, target_path) in &edges {
+            // Candidate file ids: path-suffix match first (when the link carried a path),
+            // else title (basename) match.
+            let candidates: Vec<i64> = match target_path {
+                Some(p) => {
+                    let want = path_no_ext(p);
+                    let hits: Vec<i64> = files
+                        .iter()
+                        .filter(|(_, fp)| {
+                            let fp = path_no_ext(fp);
+                            fp == want || fp.ends_with(&format!("/{want}"))
+                        })
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if hits.is_empty() {
+                        title_map.get(&title.to_lowercase()).cloned().unwrap_or_default()
+                    } else {
+                        hits
+                    }
+                }
+                None => title_map.get(&title.to_lowercase()).cloned().unwrap_or_default(),
+            };
+            if candidates.is_empty() {
+                continue; // dangling link — leave target_chunk_id NULL
+            }
+            let mut sorted = candidates.clone();
+            sorted.sort_unstable();
+            let target_file = sorted[0];
+            let Some(&chunk_id) = chunk0.get(&target_file) else {
+                continue;
+            };
+            let confidence = if candidates.len() == 1 { "exact" } else { "name_match" };
+            tx.execute(
+                "UPDATE links SET target_chunk_id = ?, confidence = ? WHERE id = ?",
+                params![chunk_id, confidence, link_id],
+            )?;
+            resolved += 1;
+        }
+        tx.commit()?;
+        Ok(resolved)
+    }
+
+    /// Notes that link TO `path` via a resolved wikilink (inbound links / "backlinks").
+    /// Returns distinct source-note paths, sorted.
+    pub fn backlinks(&self, path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT sf.path \
+             FROM links l \
+             JOIN chunks sc ON sc.id = l.source_chunk_id \
+             JOIN files sf ON sf.id = sc.file_id \
+             JOIN chunks tc ON tc.id = l.target_chunk_id \
+             JOIN files tf ON tf.id = tc.file_id \
+             WHERE l.kind = 'wikilink' AND tf.path = ? AND sf.path != tf.path \
+             ORDER BY sf.path",
+        )?;
+        let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Notes `path` links TO via resolved wikilinks (outbound links). Distinct target-note
+    /// paths, sorted.
+    pub fn forward_links(&self, path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT tf.path \
+             FROM links l \
+             JOIN chunks sc ON sc.id = l.source_chunk_id \
+             JOIN files sf ON sf.id = sc.file_id \
+             JOIN chunks tc ON tc.id = l.target_chunk_id \
+             JOIN files tf ON tf.id = tc.file_id \
+             WHERE l.kind = 'wikilink' AND sf.path = ? AND sf.path != tf.path \
+             ORDER BY tf.path",
+        )?;
+        let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn count_links(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -871,6 +1022,127 @@ impl Store {
         }
     }
 
+    // ---------- derived graph edges (Layer B) ----------
+
+    /// Read a chunk's stored embedding back out of the sqlite-vec virtual table, decoded to
+    /// f32. Used to build the kNN similarity graph. Returns None if the chunk has no vector.
+    pub fn fetch_chunk_embedding(&self, chunk_id: i64) -> Result<Option<Vec<f32>>> {
+        let blob: rusqlite::Result<Vec<u8>> = self.conn.query_row(
+            "SELECT embedding FROM chunks_vec WHERE chunk_id = ?",
+            params![chunk_id],
+            |r| r.get(0),
+        );
+        match blob {
+            Ok(b) => Ok(Some(bytes_to_f32_vec(&b))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every (chunk_id, embedding) pair, for building the similarity graph in one pass.
+    pub fn all_chunk_embeddings(&self) -> Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT chunk_id, embedding FROM chunks_vec")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, blob) = r?;
+            out.push((id, bytes_to_f32_vec(&blob)));
+        }
+        Ok(out)
+    }
+
+    /// Every (chunk_id, content) pair, for keyphrase extraction over the corpus.
+    pub fn all_chunks_for_graph(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, content FROM chunks ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_graph_edges(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM graph_edges", [])?;
+        Ok(())
+    }
+
+    /// Batch-insert derived edges in one transaction. Each tuple is
+    /// `(src_chunk_id, dst_chunk_id, kind, weight)`.
+    pub fn insert_graph_edges(&self, edges: &[(i64, i64, &str, f64)]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO graph_edges (src_chunk_id, dst_chunk_id, kind, weight) \
+                 VALUES (?, ?, ?, ?)",
+            )?;
+            for (src, dst, kind, weight) in edges {
+                stmt.execute(params![src, dst, kind, weight])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn count_graph_edges(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM graph_edges", [], |r| r.get(0))?)
+    }
+
+    /// Build the directed, weighted edge list for Personalized-PageRank retrieval (Layer C):
+    /// the union of resolved wikilinks (`links`, kind='wikilink') and derived edges
+    /// (`graph_edges`). Edge weight = a flat per-kind weight so authored links dominate:
+    /// wikilink 1.0, entity 0.6, keyphrase 0.5, similarity 0.3. Undirected sources are
+    /// symmetrized (both directions); directed wikilinks add a reverse edge at half weight so
+    /// leaf notes aren't stranded under PPR.
+    pub fn graph_edges_for_ppr(&self) -> Result<Vec<(i64, i64, f64)>> {
+        let mut out: Vec<(i64, i64, f64)> = Vec::new();
+
+        // Authored wikilinks (directed) — forward at 1.0, reverse at 0.5.
+        let mut stmt = self.conn.prepare(
+            "SELECT source_chunk_id, target_chunk_id FROM links \
+             WHERE kind = 'wikilink' AND target_chunk_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        for r in rows {
+            let (s, d) = r?;
+            if s != d {
+                out.push((s, d, 1.0));
+                out.push((d, s, 0.5));
+            }
+        }
+
+        // Derived edges (stored undirected as (min,max)) — symmetrize at the flat kind weight.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT src_chunk_id, dst_chunk_id, kind FROM graph_edges")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })?;
+        for r in rows {
+            let (s, d, kind) = r?;
+            let w = match kind.as_str() {
+                "entity" => 0.6,
+                "keyphrase" => 0.5,
+                "similarity" => 0.3,
+                _ => 0.3,
+            };
+            if s != d {
+                out.push((s, d, w));
+                out.push((d, s, w));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn fetch_chunk(&self, chunk_id: i64) -> Result<Option<FetchedChunk>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.heading_path, c.content, c.start_byte, f.path \
@@ -944,6 +1216,14 @@ fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Inverse of `f32_vec_to_bytes` — decode a little-endian f32 blob (as stored in
+/// `chunks_vec`) back to a vector. Trailing bytes that don't form a full f32 are ignored.
+fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -955,6 +1235,104 @@ fn now_secs() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The embedding written into chunks_vec round-trips back out via fetch_chunk_embedding /
+    /// all_chunk_embeddings — load-bearing for the kNN similarity graph. Also exercises the
+    /// graph_edges CRUD.
+    #[test]
+    fn embedding_roundtrip_and_graph_edges() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("g.db");
+        let mut store = Store::open(&db, 4).unwrap();
+
+        let emb_a = vec![0.1f32, 0.2, 0.3, 0.4];
+        let emb_b = vec![0.5f32, 0.6, 0.7, 0.8];
+        fn row<'a>(c: &'a str, e: &'a [f32]) -> ChunkRow<'a> {
+            ChunkRow {
+                idx: 0,
+                heading_path: "",
+                content: c,
+                start_byte: 0,
+                end_byte: c.len(),
+                embedding: e,
+                kind: "prose",
+                symbol: None,
+                parent_chunk_idx: None,
+            }
+        }
+        store.upsert_file_with_chunks("a.md", 1, 4, "ha", &[row("alpha", &emb_a)], &[]).unwrap();
+        store.upsert_file_with_chunks("b.md", 1, 4, "hb", &[row("beta", &emb_b)], &[]).unwrap();
+
+        // Find the two chunk ids.
+        let all = store.all_chunk_embeddings().unwrap();
+        assert_eq!(all.len(), 2);
+        for (_, v) in &all {
+            assert_eq!(v.len(), 4, "decoded vector has the right dim");
+        }
+        let (id_a, vec_a) = all.iter().find(|(_, v)| (v[0] - 0.1).abs() < 1e-4).cloned().unwrap();
+        // Round-trip tolerance: sqlite-vec stores f32, so this is exact-ish.
+        assert!((vec_a[3] - 0.4).abs() < 1e-4, "fetched vector matches stored");
+        let single = store.fetch_chunk_embedding(id_a).unwrap().unwrap();
+        assert_eq!(single, vec_a);
+
+        // graph_edges CRUD.
+        let (id_b, _) = all.iter().find(|(id, _)| *id != id_a).cloned().unwrap();
+        store.insert_graph_edges(&[(id_a, id_b, "similarity", 0.3)]).unwrap();
+        assert_eq!(store.count_graph_edges().unwrap(), 1);
+        store.clear_graph_edges().unwrap();
+        assert_eq!(store.count_graph_edges().unwrap(), 0);
+    }
+
+    /// Wikilink edges resolve by note title/path to the target's chunk 0, and backlinks /
+    /// forward_links read them back. Covers exact (unique title), path-qualified, and
+    /// dangling (no such note) cases.
+    #[test]
+    fn wikilink_resolution_and_backlinks() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("w.db");
+        let mut store = Store::open(&db, 4).unwrap();
+        let emb = vec![0.0f32, 0.0, 0.0, 0.0];
+
+        fn row<'a>(content: &'a str, emb: &'a [f32]) -> ChunkRow<'a> {
+            ChunkRow {
+                idx: 0,
+                heading_path: "",
+                content,
+                start_byte: 0,
+                end_byte: content.len(),
+                embedding: emb,
+                kind: "prose",
+                symbol: None,
+                parent_chunk_idx: None,
+            }
+        }
+
+        // "index.md" links to [[Target]] (title), [[sub/Deep]] (path), and [[Ghost]] (dangling).
+        let links = vec![
+            LinkRow { source_chunk_idx: 0, kind: "wikilink", target_symbol: "Target", target_path: None },
+            LinkRow { source_chunk_idx: 0, kind: "wikilink", target_symbol: "Deep", target_path: Some("sub/Deep") },
+            LinkRow { source_chunk_idx: 0, kind: "wikilink", target_symbol: "Ghost", target_path: None },
+        ];
+        store.upsert_file_with_chunks("index.md", 1, 10, "h1", &[row("see links", &emb)], &links).unwrap();
+        store.upsert_file_with_chunks("Target.md", 1, 10, "h2", &[row("i am the target", &emb)], &[]).unwrap();
+        store.upsert_file_with_chunks("sub/Deep.md", 1, 10, "h3", &[row("deep note", &emb)], &[]).unwrap();
+
+        let resolved = store.resolve_wikilinks().unwrap();
+        assert_eq!(resolved, 2, "Target + Deep resolve; Ghost dangles");
+
+        // Backlinks of the two real targets point back to index.md.
+        assert_eq!(store.backlinks("Target.md").unwrap(), vec!["index.md".to_string()]);
+        assert_eq!(store.backlinks("sub/Deep.md").unwrap(), vec!["index.md".to_string()]);
+        // Ghost.md doesn't exist → no backlinks.
+        assert!(store.backlinks("Ghost.md").unwrap().is_empty());
+
+        // Forward links of index.md are the two resolved targets.
+        let mut fwd = store.forward_links("index.md").unwrap();
+        fwd.sort();
+        assert_eq!(fwd, vec!["Target.md".to_string(), "sub/Deep.md".to_string()]);
+    }
 
     /// FTS must see `heading_path` so queries matching a section title still hit the chunk
     /// even when the chunker stripped the heading line from the body. Regression for v0.2.6.

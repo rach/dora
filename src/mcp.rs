@@ -55,6 +55,16 @@ struct SearchArgs {
     /// "files" dedupes by path and returns one hit per file (line=0, no snippet).
     #[serde(default)]
     output: Option<String>,
+    /// Boolean intersection terms. Each must also score for a chunk to remain a result;
+    /// combined score is the harmonic mean of normalized per-query scores. Equivalent to
+    /// `dora "query" --and "Y" --and "Z"` on the CLI. Use to narrow a too-broad result.
+    #[serde(default)]
+    and: Option<Vec<String>>,
+    /// Boolean exclusion terms. Chunks scoring highly on any are dropped; weaker matches
+    /// get a soft demote. Equivalent to `dora "query" --not "Z"`. Use to filter out a
+    /// known distractor topic from a search.
+    #[serde(default)]
+    not: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -140,6 +150,24 @@ struct RepoMapResult {
     outline: String,
     file_count: usize,
     chunk_count: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BacklinksArgs {
+    /// Source name (from `list_sources`).
+    source: String,
+    /// Note path relative to the source root, e.g. `Projects/dora.md`.
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BacklinksResult {
+    source: String,
+    path: String,
+    /// Notes that link TO this note (inbound / backlinks).
+    inbound: Vec<String>,
+    /// Notes this note links to (outbound).
+    outbound: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -339,9 +367,21 @@ impl ServerHandler for DoraServer {
             .with_input_schema::<MultiGetArgs>()
             .annotate(ToolAnnotations::new().read_only(true));
 
+            let backlinks = Tool::new(
+                "backlinks",
+                "Show the wikilink graph for a note: which notes link TO it (inbound / \
+                 backlinks) and which it links to (outbound). Built from `[[wikilinks]]` and \
+                 `[text](note.md)` links at index time. Use this to discover related notes and \
+                 navigate a vault structurally, the way Obsidian's backlinks pane does.",
+                std::sync::Arc::new(serde_json::Map::new()),
+            )
+            .with_input_schema::<BacklinksArgs>()
+            .annotate(ToolAnnotations::new().read_only(true));
+
             Ok(ListToolsResult {
                 tools: vec![
                     search, list, find_def, find_callers, find_impls, repo_map, multi_get,
+                    backlinks,
                 ],
                 ..Default::default()
             })
@@ -363,6 +403,7 @@ impl ServerHandler for DoraServer {
                 "find_implementations" => handle_find_implementations(&state, request).await,
                 "repo_map" => handle_repo_map(&state, request).await,
                 "multi_get" => handle_multi_get(&state, request).await,
+                "backlinks" => handle_backlinks(&state, request).await,
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool: {other}"),
                     None,
@@ -406,6 +447,8 @@ async fn handle_search(
         all: args.all.unwrap_or(false),
         path_prefix: args.path_prefix.as_deref(),
         output,
+        and_queries: args.and.unwrap_or_default(),
+        not_queries: args.not.unwrap_or_default(),
     };
 
     let mut guard = state
@@ -888,6 +931,43 @@ fn chunk_id_for_path(store: &Store, path: &str) -> Result<Option<i64>> {
     }
 }
 
+async fn handle_backlinks(
+    state: &Arc<Mutex<MultiSourceState>>,
+    request: CallToolRequestParams,
+) -> Result<CallToolResult, ErrorData> {
+    let args: BacklinksArgs = parse_args(request)?;
+    let guard = state
+        .lock()
+        .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
+    let s = guard.sources.get(&args.source).ok_or_else(|| {
+        ErrorData::invalid_params(
+            format!(
+                "unknown source '{}'. registered: {}",
+                args.source,
+                guard.order.join(", ")
+            ),
+            None,
+        )
+    })?;
+    let inbound = s
+        .store
+        .backlinks(&args.path)
+        .map_err(|e| ErrorData::internal_error(format!("backlinks: {e}"), None))?;
+    let outbound = s
+        .store
+        .forward_links(&args.path)
+        .map_err(|e| ErrorData::internal_error(format!("forward_links: {e}"), None))?;
+    let result = BacklinksResult {
+        source: args.source,
+        path: args.path,
+        inbound,
+        outbound,
+    };
+    let json = serde_json::to_string(&result)
+        .map_err(|e| ErrorData::internal_error(format!("serialize: {e}"), None))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
 fn search_one(
     s: &mut SourceState,
     query: &str,
@@ -1251,6 +1331,16 @@ fn build_search_schema(source_summary: &str) -> serde_json::Map<String, serde_js
                 "enum": ["chunks", "files"],
                 "default": "chunks",
                 "description": "Output mode. 'chunks' returns one hit per chunk with snippet + line. 'files' dedupes by path and returns one hit per file (line=0, no snippet) — pairs well with `all: true` for listing every matching file."
+            },
+            "and": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Intersection terms. A chunk must score for the primary `query` AND every entry here to remain a result; final score is the harmonic mean of normalized per-query scores. Use to narrow a too-broad search. Example: query=\"authentication\", and=[\"rate limiting\"] → chunks about both."
+            },
+            "not": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Exclusion terms. Chunks scoring highly for any entry are dropped; weaker matches are demoted. Use to filter out a known distractor. Example: query=\"caching\", not=[\"Redis\"] → caching discussions that aren't primarily about Redis."
             }
         },
         "required": ["query"]

@@ -13,7 +13,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::chunk::{Chunk, ChunkKind, Chunker};
+use crate::chunk::{Chunk, ChunkKind, Chunker, EdgeKind, EdgeSpec};
 use crate::config::ChunkingConfig;
 
 /// Holds the size knobs for chunking. One per `dora` run; configured from `ChunkingConfig`.
@@ -91,6 +91,120 @@ impl Chunker for MarkdownChunker {
 
         out
     }
+
+    /// Wikilink + markdown-link edges. Parses `[[Note]]`, `[[folder/Note]]`,
+    /// `[[Note#heading]]`, `[[Note|alias]]`, and `[text](note.md)` from the raw file,
+    /// skipping anything inside a code fence, and attributes each to the chunk whose byte
+    /// span contains the match. Targets resolve by note title/path in `Store::resolve_wikilinks`.
+    fn edges(&self, text: &str, _rel_path: &str, chunks: &[Chunk]) -> Vec<EdgeSpec> {
+        if chunks.is_empty() {
+            return Vec::new();
+        }
+        let fenced = fenced_byte_ranges(text);
+        let mut out = Vec::new();
+        for (offset, target_symbol, target_path) in find_links(text) {
+            if fenced.iter().any(|(s, e)| offset >= *s && offset < *e) {
+                continue;
+            }
+            out.push(EdgeSpec {
+                source_chunk_idx: chunk_for_offset(chunks, offset),
+                kind: EdgeKind::Wikilink,
+                target_symbol,
+                target_path,
+            });
+        }
+        out
+    }
+}
+
+/// Byte ranges covered by fenced code blocks (``` / ~~~), so links inside them are ignored.
+fn fenced_byte_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut fence_start: Option<usize> = None;
+    for (ls, le) in iter_line_spans(text) {
+        let trimmed = text[ls..le].trim_end_matches('\n').trim_end_matches('\r');
+        if is_fence_line(trimmed) {
+            match fence_start {
+                None => fence_start = Some(ls),
+                Some(s) => {
+                    ranges.push((s, le));
+                    fence_start = None;
+                }
+            }
+        }
+    }
+    if let Some(s) = fence_start {
+        ranges.push((s, text.len())); // unterminated fence → treat rest of file as fenced
+    }
+    ranges
+}
+
+/// Index of the chunk whose `[start_byte, end_byte)` span contains `offset`. Falls back to the
+/// last chunk starting at or before `offset` (links in heading lines sit in inter-chunk gaps),
+/// and to chunk 0 if nothing precedes it.
+fn chunk_for_offset(chunks: &[Chunk], offset: usize) -> usize {
+    for c in chunks {
+        if offset >= c.start_byte && offset < c.end_byte {
+            return c.idx;
+        }
+    }
+    chunks
+        .iter()
+        .filter(|c| c.start_byte <= offset)
+        .max_by_key(|c| c.start_byte)
+        .map(|c| c.idx)
+        .unwrap_or(0)
+}
+
+/// Extract `(byte_offset, target_title, target_path)` for every wikilink + markdown-link.
+/// `target_title` is the basename without extension (for title resolution); `target_path` is
+/// `Some(..)` when the link carries path information (`[[folder/Note]]` or `[text](note.md)`).
+fn find_links(text: &str) -> Vec<(usize, String, Option<String>)> {
+    let mut out = Vec::new();
+    for caps in wikilink_regex().captures_iter(text) {
+        let m = caps.get(0).unwrap();
+        let raw = caps.get(1).unwrap().as_str().trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (title, path) = split_target(raw);
+        out.push((m.start(), title, path));
+    }
+    for caps in mdlink_regex().captures_iter(text) {
+        let m = caps.get(0).unwrap();
+        let raw = caps.get(1).unwrap().as_str().trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (title, _) = split_target(raw);
+        out.push((m.start(), title, Some(raw.to_string())));
+    }
+    out
+}
+
+/// `"folder/Note"` → (`"Note"`, `Some("folder/Note")`); `"Note"` → (`"Note"`, `None`).
+/// Strips a trailing `.md` from the title component.
+fn split_target(raw: &str) -> (String, Option<String>) {
+    let last = raw.rsplit('/').next().unwrap_or(raw);
+    let title = last.strip_suffix(".md").unwrap_or(last).to_string();
+    let path = if raw.contains('/') {
+        Some(raw.to_string())
+    } else {
+        None
+    };
+    (title, path)
+}
+
+fn wikilink_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    // [[target]] with optional #heading and |alias; target excludes ] | #
+    R.get_or_init(|| Regex::new(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]").unwrap())
+}
+
+fn mdlink_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    // [text](path.md) optionally with #fragment; capture the .md path
+    R.get_or_init(|| Regex::new(r"\[[^\]]*\]\(([^)#]+\.md)(?:#[^)]*)?\)").unwrap())
 }
 
 fn prose_chunk(
@@ -467,5 +581,56 @@ fn capitalize_first(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().chain(chars).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ChunkingConfig;
+
+    fn chunker() -> MarkdownChunker {
+        MarkdownChunker::from_config(&ChunkingConfig {
+            target_bytes: 1500,
+            atomic_below_bytes: 1600,
+            overlap_bytes: 270,
+        })
+    }
+
+    #[test]
+    fn wikilinks_parsed_with_alias_heading_and_path() {
+        let text = "# Note\n\nSee [[Other Note]] and [[folder/Deep Note]] and \
+                    [[Aliased|shown text]] and [[Sectioned#heading]].\n\nAlso [a link](target.md).";
+        let chunks = chunker().chunk(text, "note.md");
+        let edges = chunker().edges(text, "note.md", &chunks);
+        let targets: Vec<&str> = edges.iter().map(|e| e.target_symbol.as_str()).collect();
+        assert!(targets.contains(&"Other Note"), "bare wikilink: {targets:?}");
+        assert!(targets.contains(&"Deep Note"), "path wikilink basename: {targets:?}");
+        assert!(targets.contains(&"Aliased"), "alias stripped: {targets:?}");
+        assert!(targets.contains(&"Sectioned"), "heading stripped: {targets:?}");
+        assert!(targets.contains(&"target"), "md-link basename: {targets:?}");
+        // folder/Deep Note carries a path; bare Other Note does not.
+        let deep = edges.iter().find(|e| e.target_symbol == "Deep Note").unwrap();
+        assert_eq!(deep.target_path.as_deref(), Some("folder/Deep Note"));
+        let other = edges.iter().find(|e| e.target_symbol == "Other Note").unwrap();
+        assert_eq!(other.target_path, None);
+        assert!(edges.iter().all(|e| e.kind == EdgeKind::Wikilink));
+    }
+
+    #[test]
+    fn wikilinks_inside_code_fences_ignored() {
+        let text = "# Note\n\nReal [[Linked]].\n\n```\nnot a [[FencedLink]] here\n```\n\nEnd.";
+        let chunks = chunker().chunk(text, "n.md");
+        let edges = chunker().edges(text, "n.md", &chunks);
+        let targets: Vec<&str> = edges.iter().map(|e| e.target_symbol.as_str()).collect();
+        assert!(targets.contains(&"Linked"));
+        assert!(!targets.contains(&"FencedLink"), "fenced link must be skipped: {targets:?}");
+    }
+
+    #[test]
+    fn no_links_no_edges() {
+        let text = "# Plain\n\nNothing to link here.";
+        let chunks = chunker().chunk(text, "p.md");
+        assert!(chunker().edges(text, "p.md", &chunks).is_empty());
     }
 }

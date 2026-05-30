@@ -290,7 +290,7 @@ dora's incremental indexing means re-running `dora index` is cheap. Queries also
 
 ```mermaid
 flowchart TD
-    Q["User query"] --> FTS["FTS5 + heading-path<br/>(BM25)"]
+    Q["User query<br/>(+ optional --and / --not)"] --> FTS["FTS5 + heading-path<br/>(BM25)"]
     Q --> ANN["Vector ANN<br/>(local ONNX embedder)"]
     Q --> LIT["Literal substring<br/>(camelCase, snake_case,<br/>magic constants)"]
     ANN --> PRF["PRF arm<br/>top-10 vector hits →<br/>corpus tokens → FTS5"]
@@ -298,9 +298,11 @@ flowchart TD
     ANN --> RRF
     LIT --> RRF
     PRF --> RRF
-    RRF --> COL["Per-file collapse<br/>+ min_score / top_k"]
+    RRF --> PPR["Graph PPR boost<br/>(wikilinks + keyphrase + similarity)<br/>cap +0.03"]
+    PPR --> BOOL["Boolean overlay<br/>--and: harmonic-mean intersect<br/>--not: hard-drop + soft-demote"]
+    BOOL --> COL["Per-file collapse<br/>+ min_score / top_k"]
     COL --> OUT["Ranked hits<br/>(MCP / CLI / JSON)"]
-    COL -. best-effort .-> LOG[("usage table<br/>(query, embedding,<br/>returned chunks)<br/>→ v0.7 signal rerank")]
+    COL -. best-effort .-> LOG[("usage table<br/>(query, embedding,<br/>returned chunks)<br/>→ future signal rerank")]
 ```
 
 ### Choosing an embedder
@@ -330,9 +332,21 @@ The next `dora index` will detect the change, wipe the old vectors, and re-embed
 
 **Indexing.** dora reads each `.md` file, splits it into chunks (respecting headings, code blocks, tables), generates a vector embedding per chunk using a small local ML model (default: a quantized BGE-base, ~33 MB ONNX file that runs on your laptop). Stores everything in SQLite alongside an FTS5 index.
 
-**Searching.** When you query, dora embeds the query the same way, then runs four searches in parallel: a keyword-based one (BM25 / FTS5 over the chunk content + heading path), a vector-similarity one, a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`), and a pseudo-relevance feedback arm (the top vector hits' most-frequent non-stopword tokens become a second FTS5 query — closes vocabulary gaps without an LLM). All four ranked lists merge via Reciprocal Rank Fusion. You get the top N results back.
+**Searching.** When you query, dora embeds the query the same way, then runs four searches in parallel: a keyword-based one (BM25 / FTS5 over the chunk content + heading path), a vector-similarity one, a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`), and a pseudo-relevance feedback arm (the top vector hits' most-frequent non-stopword tokens become a second FTS5 query — closes vocabulary gaps without an LLM). All four ranked lists merge via Reciprocal Rank Fusion. The merged list then gets a small graph-PPR boost (chunks densely connected to the top hits via `[[wikilinks]]` or keyphrase/similarity edges surface a bit higher — associative recall without an LLM). If you passed `--and`/`--not`, the boolean overlay intersects/excludes against those side queries. You get the top N results back.
 
-**Usage logging.** Every search records its query and returned chunk IDs to a local `usage` table — data-collection-only in v0.6, the input for v0.7's signal-based reranker and v0.9's in-process LoRA fine-tuning. No telemetry leaves your machine.
+**Boolean search (v0.7).** dora supports `--and` and `--not` flags (also `and`/`not` arrays on the MCP `search` tool):
+
+```sh
+dora "auth"          --and "rate limit"        # intersection: chunks about both
+dora "caching"       --not "Redis"             # exclusion: caching but not Redis
+dora "X" -a "Y" -a "Z" -n "W"                  # compose: (X ∩ Y ∩ Z) \ W
+```
+
+Each `--and` adds another hybrid search; the combined score is the harmonic mean of normalized per-query scores (asymmetry is punished — strong on X, weak on Y ranks below moderately strong on both). `--not` hard-drops chunks scoring above 0.5 for the not-term and soft-demotes weaker matches.
+
+**Document graph (v0.7).** dora parses `[[wikilinks]]` and `[text](note.md)` links from your markdown into a graph and derives additional edges from keyphrase co-occurrence + embedding similarity. Surfaced via `dora backlinks <note>` (who links to this), the `backlinks` MCP tool, and the PPR boost above. Rebuild on demand with `dora graph rebuild`. No LLM, no Python — explicit links + statistical extraction.
+
+**Usage logging.** Every search records its query and returned chunk IDs to a local `usage` table — data-collection-only today, the input for a future signal-based reranker and v0.9's in-process LoRA fine-tuning. No telemetry leaves your machine.
 
 **Incremental.** After the first index, only changed files get re-embedded. Detected via mtime + content hash. Renames are detected and don't re-embed. Even on a vault with 2,500+ chunks (e.g. the Rust Book), a no-op re-index takes about 130 milliseconds.
 

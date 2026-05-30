@@ -80,6 +80,10 @@ pub enum EdgeKind {
     Implements,
     Imports,
     Extends,
+    /// Authored prose link: Obsidian `[[wikilink]]` or markdown `[text](note.md)`.
+    /// Resolved by note title/path (not symbol) and kept distinct from code edges so
+    /// PageRank's identifier heuristics never touch it.
+    Wikilink,
 }
 
 /// All chunkers implement this. Sync because indexing is sync; `Send` because main spawns

@@ -2,6 +2,7 @@ mod chunk;
 mod config;
 mod doctor;
 mod embed;
+mod graph;
 mod install;
 mod mcp;
 mod migrations;
@@ -66,6 +67,18 @@ struct Cli {
     /// `:line:` prefix, no snippet, no heading. Pairs well with `--all` / `--min-score`.
     #[arg(long, global = true)]
     files: bool,
+
+    /// Repeatable. Intersect: a chunk must also score for this query. `dora "X" --and "Y"`
+    /// ≈ "chunks about both X and Y". Each `--and` adds another hybrid search; the combined
+    /// score is the harmonic mean of normalized per-query scores (asymmetry is punished).
+    #[arg(long = "and", short = 'a', global = true, value_name = "QUERY")]
+    and: Vec<String>,
+
+    /// Repeatable. Exclude/demote: chunks scoring highly for this query are dropped;
+    /// weaker matches are nudged down. `dora "X" --not "Z"` ≈ "X but not Z". Composes
+    /// with `--and`.
+    #[arg(long = "not", short = 'n', global = true, value_name = "QUERY")]
+    not: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -179,6 +192,25 @@ enum Command {
         #[command(subcommand)]
         action: ContextAction,
     },
+    /// Show the wikilink graph for a note in the current source: which notes link to it
+    /// (backlinks / inbound) and which it links to (outbound). Built at index time from
+    /// `[[wikilinks]]` and `[text](note.md)` links.
+    Backlinks {
+        /// Note path relative to the source root, e.g. `Projects/dora.md`.
+        path: String,
+    },
+    /// Document-graph maintenance.
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Force a full rebuild of the derived edges (keyphrase + similarity) for the current
+    /// source. Normally runs automatically at index time; use this after tuning or to inspect.
+    Rebuild,
 }
 
 #[derive(Subcommand)]
@@ -290,12 +322,23 @@ fn main() -> Result<()> {
         Some(Command::Watch { include, exclude }) => cmd_watch(include, exclude),
         Some(Command::Wrappers { action }) => cmd_wrappers(action),
         Some(Command::Context { action }) => cmd_context(action),
+        Some(Command::Backlinks { path }) => {
+            let cwd = std::env::current_dir()?;
+            cmd_backlinks(&cwd, &path)
+        }
+        Some(Command::Graph { action }) => {
+            let cwd = std::env::current_dir()?;
+            cmd_graph(&cwd, action)
+        }
         None => {
             let q = cli
                 .query
                 .context("provide a query, or use `dora index <path>` first")?;
             let cwd = std::env::current_dir()?;
-            cmd_search(&cwd, &q, cli.top_k, cli.json, cli.min_score, cli.all, cli.files)
+            cmd_search(
+                &cwd, &q, cli.top_k, cli.json, cli.min_score, cli.all, cli.files,
+                cli.and, cli.not,
+            )
         }
     }
 }
@@ -841,6 +884,8 @@ fn cmd_search(
     min_score: Option<f64>,
     all: bool,
     files: bool,
+    and_queries: Vec<String>,
+    not_queries: Vec<String>,
 ) -> Result<()> {
     let source_root = cwd.canonicalize()?;
     let db = db_path(&source_root);
@@ -876,6 +921,8 @@ fn cmd_search(
         } else {
             search::OutputMode::Chunks
         },
+        and_queries,
+        not_queries,
     };
     let hits = search_with_self_heal(
         &source_root,
@@ -1049,6 +1096,69 @@ impl AnsiStyle {
                 italic_dim: "",
                 reset: "",
             }
+        }
+    }
+}
+
+// ---------------- backlinks (Layer A graph) ----------------
+
+fn cmd_backlinks(cwd: &Path, path: &str) -> Result<()> {
+    let source_root = cwd.canonicalize()?;
+    let db = db_path(&source_root);
+    if !db.exists() {
+        bail!(
+            ".dora/index.db not found in {}. Run `dora index` first.",
+            source_root.display()
+        );
+    }
+    let cfg = Config::load_or_default(&source_root).context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+    let store = Store::open(&db, embedder.dims())?;
+
+    let inbound = store.backlinks(path)?;
+    let outbound = store.forward_links(path)?;
+
+    if inbound.is_empty() && outbound.is_empty() {
+        eprintln!("no wikilinks to or from {path}");
+        return Ok(());
+    }
+    if !inbound.is_empty() {
+        println!("{} note(s) link to {path}:", inbound.len());
+        for p in &inbound {
+            println!("  ← {p}");
+        }
+    }
+    if !outbound.is_empty() {
+        if !inbound.is_empty() {
+            println!();
+        }
+        println!("{path} links to {} note(s):", outbound.len());
+        for p in &outbound {
+            println!("  → {p}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_graph(cwd: &Path, action: GraphAction) -> Result<()> {
+    match action {
+        GraphAction::Rebuild => {
+            let source_root = cwd.canonicalize()?;
+            let db = db_path(&source_root);
+            if !db.exists() {
+                bail!(
+                    ".dora/index.db not found in {}. Run `dora index` first.",
+                    source_root.display()
+                );
+            }
+            let cfg = Config::load_or_default(&source_root).context("load config")?;
+            let embedder: DynEmbedder =
+                embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+            let store = Store::open(&db, embedder.dims())?;
+            let started = Instant::now();
+            let n = graph::rebuild_derived_edges(&store, cfg.graph.entities)?;
+            eprintln!("rebuilt {n} derived edge(s) in {:.2?}", started.elapsed());
+            Ok(())
         }
     }
 }
@@ -1344,11 +1454,25 @@ fn run_incremental_index(
         }
     }
 
-    // Phase 7b: pass-2 cross-file edge resolution. Only meaningful for code sources, but
-    // running it on a markdown-only source is a no-op (no links rows exist). Also runs
-    // when files were deleted/renamed, since SET NULL may have orphaned links.
+    // Phase 7b: pass-2 edge resolution. Code edges resolve by symbol; wikilinks resolve by
+    // note title/path. Both no-op when their edge kind is absent. Also runs when files were
+    // deleted/renamed, since SET NULL may have orphaned links.
     if any_edges || !to_delete.is_empty() || !to_rename.is_empty() {
         let _resolved = store.resolve_cross_file_links()?;
+        let _wiki = store.resolve_wikilinks()?;
+    }
+
+    // Phase 8b: rebuild Layer-B derived edges (keyphrase + similarity) for prose sources when
+    // the corpus changed. Code sources rely on the symbol graph instead. Derived edges are
+    // global (kNN / co-occurrence reference all chunks), so any change triggers a full rebuild.
+    let chunks_changed = summary.inserted > 0
+        || summary.updated > 0
+        || !to_delete.is_empty()
+        || !to_rename.is_empty();
+    if cfg.source.mode != "code" && chunks_changed {
+        if let Err(e) = graph::rebuild_derived_edges(store, cfg.graph.entities) {
+            eprintln!("dora: derived-edge rebuild failed (continuing): {e}");
+        }
     }
 
     // Phase 8: bump last_walk_at so cmd_search debounces.
@@ -1383,6 +1507,7 @@ fn edge_kind_str(k: chunk::EdgeKind) -> &'static str {
         Implements => "implements",
         Imports => "imports",
         Extends => "extends",
+        Wikilink => "wikilink",
     }
 }
 

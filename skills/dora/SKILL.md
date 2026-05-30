@@ -29,6 +29,14 @@ what *mode* the source is in.
 > queries that don't share vocabulary with the corpus still get good recall without any config.
 > Hits now carry a `chunk_id` field; reading the matched file via `multi_get` within ~60s
 > signals back to dora that the hit was useful, which informs future ranking (v0.7+).
+>
+> The `search` tool also accepts `and: [...]` (intersection) and `not: [...]` (exclusion)
+> arrays — equivalent to the CLI's `--and` / `--not` flags. Reach for `and` to narrow a
+> too-broad result (`search({query:"authentication", and:["rate limiting"]})` returns chunks
+> about *both*) and `not` to filter out a known distractor (`search({query:"caching",
+> not:["Redis"]})` excludes Redis-heavy hits). Both are repeatable; they compose. Note: 3-way
+> intersections often return ≤5 hits — that's by design (the harmonic mean punishes a weak
+> match on any one term), not a bug.
 
 ## Step 1 — detect the source mode
 

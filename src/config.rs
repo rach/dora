@@ -28,6 +28,20 @@ pub struct Config {
     pub embedder: EmbedderConfig,
     pub claude_code: ClaudeCodeConfig,
     pub codex: CodexConfig,
+    pub graph: GraphConfig,
+}
+
+/// `[graph]` settings (Layer B derived edges). `entities` opts into the GLiNER entity-edge
+/// extractor (~300 MB ONNX); off by default — keyphrase + similarity edges are always built.
+#[derive(Debug, Clone)]
+pub struct GraphConfig {
+    pub entities: bool,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self { entities: false }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +146,13 @@ struct RawConfig {
     embedder: RawEmbedderConfig,
     claude_code: RawClaudeCodeConfig,
     codex: RawCodexConfig,
+    graph: RawGraphConfig,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawGraphConfig {
+    entities: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -266,6 +287,9 @@ impl Config {
                         .unwrap_or(d.include_reasoning),
                     settle_seconds: raw.codex.settle_seconds.unwrap_or(d.settle_seconds),
                 }
+            },
+            graph: GraphConfig {
+                entities: raw.graph.entities.unwrap_or(false),
             },
         }
     }

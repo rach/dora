@@ -44,6 +44,22 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
          ); \
          CREATE INDEX IF NOT EXISTS idx_usage_created ON usage(created_at);",
     ),
+    // graph (Layer B): derived chunk↔chunk edges (keyphrase / similarity / entity),
+    // recomputed and wiped-and-rebuilt per source at index time. Kept separate from the
+    // authored `links` table so the code symbol graph + wikilinks are never polluted.
+    // Feeds the Personalized-PageRank retrieval boost (Layer C).
+    (
+        3,
+        "CREATE TABLE IF NOT EXISTS graph_edges ( \
+             id           INTEGER PRIMARY KEY, \
+             src_chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE, \
+             dst_chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE, \
+             kind         TEXT NOT NULL, \
+             weight       REAL NOT NULL DEFAULT 1.0 \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_ge_src ON graph_edges(src_chunk_id); \
+         CREATE INDEX IF NOT EXISTS idx_ge_dst ON graph_edges(dst_chunk_id);",
+    ),
 ];
 
 /// Apply any migrations whose version is newer than the `MAX(version)` in the

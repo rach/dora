@@ -4,6 +4,78 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-30
+
+The "graph + boolean" release. Two big additions, both in service of *finding things
+single-query search structurally can't*: a document graph (wikilinks + derived edges,
+with a Personalized-PageRank retrieval boost) and boolean operators (`--and` / `--not`)
+on every search.
+
+### Added — document graph
+
+- **Wikilink graph.** `[[wikilinks]]` and `[text](note.md)` links in markdown are
+  parsed into the existing `links` table at index time, resolved by note title/path
+  to the target's chunk 0. Handles `[[folder/Note]]`, `[[Note#heading]]`, and
+  `[[Note|alias]]`. Code fences are skipped.
+- **Backlinks.** `dora backlinks <note>` shows inbound + outbound links; the MCP
+  `backlinks` tool returns the same as JSON. Validated against an 11-note linked
+  fixture: 11/11 exact-match.
+- **Derived edges** (new `graph_edges` table, migration #3, rebuilt per source at
+  index time): RAKE keyphrase co-occurrence (≥2 shared salient words, hub-capped at
+  DF>50) + kNN embedding similarity (cosine ≥0.75). No external dep, no model — pure
+  statistics + the embedder you already have. ~100 ms for 160 chunks. `dora graph
+  rebuild` forces it; `[graph] entities = true` stubs an optional GLiNER NER path
+  (not implemented in 0.7).
+- **Personalized-PageRank retrieval boost.** Seeds PPR with the merged top hits
+  (weighted by RRF score), spreads across the wikilink + derived-edge graph, and
+  adds a bounded boost (cap +0.03) so graph-central chunks surface. Edge weights
+  authored-dominate: wikilink 1.0, entity 0.6, keyphrase 0.5, similarity 0.3.
+  Wikilinks are symmetrized (reverse at 0.5). On the 53-query flat fixture (no
+  authored links): R@1 lifts **0.943 → 0.962**, MRR **0.965 → 0.974** — the boost
+  is net-positive even where the PRD predicted break-even. `DORA_DISABLE_GRAPH=1`
+  is an A/B switch.
+- **`compute_ppr` engine.** Extracted from `pagerank.rs::compute()` as a generic
+  Personalized-PageRank engine over `(edges, seed)`. `repo_map`'s code-symbol
+  PageRank now delegates to it (bit-identical behavior, "row per file" contract
+  preserved). Same engine drives the retrieval boost.
+
+### Added — boolean search
+
+- **`--and` / `--not` flags (CLI + MCP `search` tool).** Repeatable; short forms
+  `-a` / `-n`. Turns dora's search into a tight boolean-algebra surface:
+
+  | set op | command | meaning |
+  |---|---|---|
+  | union | `dora "X"` *(unchanged)* | chunks about X |
+  | **intersection** | `dora "X" --and "Y" --and "Z"` | chunks about *all* of them |
+  | **difference** | `dora "X" --not "Z"` | chunks about X but not Z |
+
+  Each flag runs the same hybrid pipeline as the primary so ranking semantics stay
+  consistent. Intersection scores chunks by the harmonic mean of normalized
+  per-query scores (asymmetry is punished); exclusion hard-drops chunks scoring
+  above 0.5 for the not-term and soft-demotes weaker matches. MCP `search` gains
+  `and: [...]` / `not: [...]` array params with the same semantics. No new
+  infrastructure — pure score arithmetic on the existing 4-arm pipeline. ~150 LoC.
+
+### Changed
+
+- `search()` refactored: the 4-arm hybrid pipeline is extracted into a
+  `compute_merged` helper so the boolean overlay can reuse it per side query.
+  Behavior on the primary path is bit-identical (verified against the v0.6.1 eval
+  fixtures: R@1 / R@5 / R@10 / MRR unchanged).
+- README "Retrieval pipeline" mermaid updated to show the graph PPR boost + the
+  boolean overlay in the flow.
+
+### Migration note
+
+The graph foundation adds migration #3 (`graph_edges` table). Applied
+automatically on first open after upgrade — no user action. Derived edges only
+build for prose modes (notes / obsidian / docs / claude-code / codex); code mode
+keeps relying on the existing symbol graph. First `dora index` after upgrade on a
+markdown source spends an extra ~100 ms / 160 chunks computing derived edges.
+
+## [0.6.1] — 2026-05-27
+
 ## [0.6.1] — 2026-05-27
 
 ### Changed
