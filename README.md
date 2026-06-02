@@ -293,7 +293,7 @@ flowchart TD
     Q["User query<br/>(+ optional --and / --not)"] --> FTS["FTS5 + heading-path<br/>(BM25)"]
     Q --> ANN["Vector ANN<br/>(local ONNX embedder)"]
     Q --> LIT["Literal substring<br/>(camelCase, snake_case,<br/>magic constants)"]
-    ANN --> PRF["PRF arm<br/>top-10 vector hits →<br/>corpus tokens → FTS5"]
+    ANN --> PRF["Down-weighted PRF arm<br/>top-10 vector hits →<br/>corpus tokens → FTS5"]
     FTS --> RRF["Reciprocal Rank Fusion<br/>Σ 1/(60+rank)<br/>+ rank-1 bonus +0.05<br/>+ rank-2/3 bonus +0.02"]
     ANN --> RRF
     LIT --> RRF
@@ -306,7 +306,7 @@ flowchart TD
 
 ### Choosing an embedder
 
-dora defaults to `bge-base-en-v1.5-onnx-q` (Qdrant's int8-quantized BGE-base). It hits the sweet spot of the accuracy / size / cold-start curve on the maintainer's 53-query eval fixture — same R@1 as a model 10× its size, and faster to load than a smaller-but-non-quantized alternative. You don't need to change this unless you have a specific reason.
+dora defaults to `bge-base-en-v1.5-onnx-q` (Qdrant's int8-quantized BGE-base). It hits the sweet spot of the accuracy / size / cold-start curve in maintainer evals and the committed fixture harness. You don't need to change this unless you have a specific reason.
 
 | Model | Size | R@1 | MRR | Notes |
 |---|---|---|---|---|
@@ -315,7 +315,7 @@ dora defaults to `bge-base-en-v1.5-onnx-q` (Qdrant's int8-quantized BGE-base). I
 | `bge-base-en-v1.5` | ~110 MB | 0.925 | 0.956 | full precision, marginal lift over the quantized version |
 | `embeddinggemma-300m-onnx` | ~333 MB | 0.943 | 0.967 | matches qmd's embedder; +0.2pt MRR for 10× the size |
 
-Numbers from `~/.dora-eval-hard/` (20 docs, 53 queries — easy / medium / hard mix). PRF on for all rows. Your corpus may shift these by a few points; the relative ordering is stable. For a head-to-head, dora's full hybrid stack (bge-base-Q + FTS + literal + PRF) lands at 0.943 R@1 against qmd's LLM-augmented pipeline at 0.962 — a 1.9pt gap with no LLM dependency.
+Numbers from maintainer evals (`~/.dora-eval-hard/`, 20 docs, 53 queries — easy / medium / hard mix). Your corpus may shift these by a few points; the relative ordering is stable. For head-to-head changes, use the committed fixtures (`cargo run -- eval fixtures/eval/notes` and `cargo run -- eval fixtures/eval/code`) so retrieval tweaks stay reproducible.
 
 OpenAI is supported via `provider = "openai"` (`text-embedding-3-small` / `text-embedding-3-large` / `ada-002`). Pay-per-use, no local model, costs surface in the index summary.
 
@@ -331,7 +331,7 @@ The next `dora index` will detect the change, wipe the old vectors, and re-embed
 
 **Indexing.** dora reads each `.md` file, splits it into chunks (respecting headings, code blocks, tables), generates a vector embedding per chunk using a small local ML model (default: a quantized BGE-base, ~33 MB ONNX file that runs on your laptop). Stores everything in SQLite alongside an FTS5 index.
 
-**Searching.** When you query, dora embeds the query the same way, then runs four searches in parallel: a keyword-based one (BM25 / FTS5 over the chunk content + heading path), a vector-similarity one, a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`), and a pseudo-relevance feedback arm (the top vector hits' most-frequent non-stopword tokens become a second FTS5 query — closes vocabulary gaps without an LLM). All four ranked lists merge via Reciprocal Rank Fusion. The merged list then gets a small graph-PPR boost (chunks densely connected to the top hits via `[[wikilinks]]` or keyphrase/similarity edges surface a bit higher — associative recall without an LLM). If you passed `--and`/`--not`, the boolean overlay intersects/excludes against those side queries. You get the top N results back.
+**Searching.** When you query, dora embeds the query the same way, then runs four searches in parallel: a keyword-based one (BM25 / FTS5 over the chunk content + heading path), a vector-similarity one, a literal-substring scan (so identifier-shape queries like `processRequest` or `E_NOENT` work natively without falling through to `rg`), and a down-weighted pseudo-relevance feedback arm (the top vector hits' most-frequent non-stopword tokens become a second FTS5 query — closes vocabulary gaps without an LLM, but with lower influence than the primary arms). The ranked lists merge via Reciprocal Rank Fusion. The merged list then gets a small graph-PPR boost (chunks densely connected to the top hits via `[[wikilinks]]` or keyphrase/similarity edges surface a bit higher — associative recall without an LLM). If you passed `--and`/`--not`, the boolean overlay intersects/excludes against those side queries. You get the top N results back.
 
 **Boolean search (v0.7).** dora supports `--and` and `--not` flags (also `and`/`not` arrays on the MCP `search` tool):
 
@@ -450,8 +450,9 @@ Auto-detects `mode=codex`, defaults the source name to `codex`. Each hit's `head
 
 ```
 dora index [<path>]                                              # build/update the index for <path> (defaults to cwd)
-dora "<query>" [--top-k N] [--json] [--min-score F] [--all] [--files]
+dora "<query>" [--top-k N] [--json] [--signals] [--min-score F] [--all] [--files]
                                                                  # search the index in cwd
+dora explain "<query>" [--json]                                  # explain retrieval arms + final ranking
 dora source add <path> [--name N] [--description "…"] [--mode M] # register a folder; --mode obsidian|notes|docs|code|auto|claude-code|codex
 dora source list                                                 # show registered folders
 dora source remove <name>                                        # unregister
@@ -466,6 +467,8 @@ dora watch [--include …] [--exclude …]                           # foregroun
 dora wrappers <on|off|status>                                    # toggle the grep/rg/ag/find shell wrappers without editing ~/.zshrc
 dora mcp --http [--bind ADDR] [--port N] [--daemon]              # serve MCP over HTTP for multi-client setups (one persistent process, resident models)
 dora mcp <stop|status>                                           # SIGTERM the http daemon / report uptime
+cargo run -- eval fixtures/eval/notes                            # contributor eval harness (debug builds only)
+cargo run -- eval fixtures/eval/code
 ```
 
 ### Output modes for agents
@@ -620,14 +623,16 @@ nohup dora watch > /tmp/dora-watch.log &   # background it
 
 ### `dora mcp [--include …] [--exclude …] [--source <path>]`
 
-The MCP server, normally launched by Claude Code itself (via the config `dora install` patched in). Exposes six tools:
+The MCP server, normally launched by Claude Code itself (via the config `dora install` patched in). Exposes eight tools:
 
-- `mcp__dora__search(query, source?, top_k?, path_prefix?)` — hybrid search across notes *or* code.
+- `mcp__dora__search(query, source?, top_k?, min_score?, all?, output?, path_prefix?, and?, not?)` — hybrid search across notes *or* code.
 - `mcp__dora__list_sources()` — list registered folders with descriptions + counts.
 - `mcp__dora__find_definition(symbol, source?, limit?)` — code: locate where a symbol is defined.
 - `mcp__dora__find_callers(symbol, source?, depth?, limit?)` — code: who calls this function/method (recursive CTE, max depth 5).
 - `mcp__dora__find_implementations(symbol, source?, limit?)` — code: implementations of a trait / interface.
 - `mcp__dora__repo_map(source, focus_paths?, token_budget?)` — code: PageRank-ranked outline biased toward `focus_paths`.
+- `mcp__dora__multi_get(source, pattern, max_bytes?)` — batch-read whole files by glob after search, with best-effort usage attribution.
+- `mcp__dora__backlinks(source, path)` — notes: inbound and outbound markdown links for a note.
 
 Concurrent processes are safe (WAL mode, per-file transactions, 5s busy timeout). Embedders are shared across folders that use the same model — three folders on the default model load the ONNX file once, not three times.
 
@@ -694,11 +699,11 @@ Switching `mode` or `model` triggers a clean re-index on next run.
 
 ## Project status
 
-**v0.2 ships code-aware sources.** Six languages on day 1 (Rust, Python, TS+JS, Go, Java, Ruby) via tree-sitter. Four new MCP tools — `find_definition`, `find_callers`, `find_implementations`, `repo_map`. PageRank scoring. Mode presets with auto-detection. Markdown sources from v0.1 continue working unchanged.
+**Code-aware sources.** Rust, Python, TS+JS, Go, Java, and Ruby are chunked structurally via tree-sitter. Code sources get symbol lookup (`find_definition`, `find_callers`, `find_implementations`), `repo_map`, PageRank scoring, mode presets, and auto-detection. Markdown sources continue working unchanged.
 
-**Working end-to-end** — CLI, MCP, install/doctor, watcher, multi-source registry, four shell wrappers, OpenAI integration, code chunking + symbol graph. Used daily against multiple personal vaults + codebases.
+**Current status** — release builds are available via Homebrew and GitHub Releases for Apple Silicon macOS. CLI, MCP, install/doctor, watcher, multi-source registry, shell wrappers, OpenAI integration, code chunking + symbol graph, document graph, explain view, and committed eval fixtures are working end to end. Used daily against multiple personal vaults + codebases.
 
-**Not yet release-grade** — no automated test corpus, no Homebrew formula, prebuilt binary is Apple Silicon only. To try it on Intel Mac or Linux, clone + `cargo build --release` yourself.
+**Portability** — prebuilt release assets are currently macOS arm64 only. Intel Mac and Linux users can build from source with `cargo build --release`.
 
 ## License
 
