@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,6 @@ use crate::chunk::Chunker;
 use crate::config::Config;
 use crate::embed::{self, DynEmbedder};
 use crate::store::Store;
-
-const DEFAULT_TOP_K: usize = 5;
 
 #[derive(Debug, Deserialize)]
 struct EvalFile {
@@ -24,13 +22,16 @@ struct EvalQuery {
     relevant: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct EvalOutcome {
     name: String,
+    query: String,
+    relevant: Vec<String>,
     rank: Option<usize>,
+    top_hit: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct EvalMetrics {
     queries: usize,
     r_at_1: f64,
@@ -39,7 +40,26 @@ struct EvalMetrics {
     mrr: f64,
 }
 
-pub(crate) fn cmd_eval(fixture: &Path, min_r_at_1: Option<f64>) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EvalOptions {
+    pub top_k: usize,
+    pub min_r_at_1: Option<f64>,
+    pub json: bool,
+    pub disable_prf: bool,
+    pub disable_graph: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalReport {
+    fixture: String,
+    top_k: usize,
+    disable_prf: bool,
+    disable_graph: bool,
+    metrics: EvalMetrics,
+    outcomes: Vec<EvalOutcome>,
+}
+
+pub(crate) fn cmd_eval(fixture: &Path, opts: EvalOptions) -> Result<()> {
     let fixture = fixture
         .canonicalize()
         .context("canonicalize eval fixture")?;
@@ -47,27 +67,57 @@ pub(crate) fn cmd_eval(fixture: &Path, min_r_at_1: Option<f64>) -> Result<()> {
     if eval_file.queries.is_empty() {
         bail!("eval fixture has no [[query]] entries");
     }
+    if opts.top_k == 0 {
+        bail!("--top-k must be at least 1");
+    }
 
     let temp_root = make_temp_root()?;
-    let result = run_eval_in_temp(&fixture, &temp_root, &eval_file.queries);
+    let _env = EvalEnv::apply(opts.disable_prf, opts.disable_graph);
+    let result = run_eval_in_temp(&fixture, &temp_root, &eval_file.queries, opts.top_k);
     let _ = fs::remove_dir_all(&temp_root);
     let (metrics, outcomes) = result?;
 
-    println!("queries: {}", metrics.queries);
-    println!("R@1: {:.3}", metrics.r_at_1);
-    println!("R@3: {:.3}", metrics.r_at_3);
-    println!("R@5: {:.3}", metrics.r_at_5);
-    println!("MRR: {:.3}", metrics.mrr);
+    let report = EvalReport {
+        fixture: fixture.display().to_string(),
+        top_k: opts.top_k,
+        disable_prf: opts.disable_prf,
+        disable_graph: opts.disable_graph,
+        metrics,
+        outcomes,
+    };
 
-    let failures: Vec<&EvalOutcome> = outcomes.iter().filter(|o| o.rank.is_none()).collect();
-    if !failures.is_empty() {
-        println!("misses:");
-        for failure in failures {
-            println!("  {}", failure.name);
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("fixture: {}", report.fixture);
+        println!("top_k: {}", report.top_k);
+        if opts.disable_prf || opts.disable_graph {
+            println!(
+                "ablations: prf={} graph={}",
+                if opts.disable_prf { "off" } else { "on" },
+                if opts.disable_graph { "off" } else { "on" }
+            );
+        }
+        println!("queries: {}", report.metrics.queries);
+        println!("R@1: {:.3}", report.metrics.r_at_1);
+        println!("R@3: {:.3}", report.metrics.r_at_3);
+        println!("R@5: {:.3}", report.metrics.r_at_5);
+        println!("MRR: {:.3}", report.metrics.mrr);
+
+        let failures: Vec<&EvalOutcome> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.rank.is_none())
+            .collect();
+        if !failures.is_empty() {
+            println!("misses:");
+            for failure in failures {
+                println!("  {} (top: {:?})", failure.name, failure.top_hit);
+            }
         }
     }
 
-    if let Some(min) = min_r_at_1 {
+    if let Some(min) = opts.min_r_at_1 {
         if metrics.r_at_1 < min {
             bail!(
                 "R@1 {:.3} below required threshold {:.3}",
@@ -84,12 +134,14 @@ fn run_eval_in_temp(
     fixture: &Path,
     temp_root: &Path,
     queries: &[EvalQuery],
+    top_k: usize,
 ) -> Result<(EvalMetrics, Vec<EvalOutcome>)> {
     copy_docs(&fixture.join("docs"), temp_root)?;
     fs::create_dir_all(crate::dora_dir(temp_root))?;
 
     let cfg = Config::load_or_default(temp_root).context("load eval config")?;
-    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &crate::models_dir(temp_root))?;
+    let model_dir = eval_models_dir(temp_root)?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &model_dir)?;
     let chunker: Box<dyn Chunker> = crate::chunk::from_config(&cfg, temp_root);
     let db = crate::db_path(temp_root);
     if db.exists() && !crate::meta_matches(&db, embedder.as_ref())? {
@@ -115,7 +167,7 @@ fn run_eval_in_temp(
             temp_root,
             "eval",
             crate::search::SearchOptions {
-                top_k: DEFAULT_TOP_K,
+                top_k,
                 diagnostics: true,
                 ..Default::default()
             },
@@ -126,13 +178,51 @@ fn run_eval_in_temp(
             .enumerate()
             .find(|(_, hit)| relevant.contains(hit.path.as_str()))
             .map(|(idx, _)| idx + 1);
+        let top_hit = hits.first().map(|h| h.path.clone());
         outcomes.push(EvalOutcome {
             name: q.name.clone(),
+            query: q.query.clone(),
+            relevant: q.relevant.clone(),
             rank,
+            top_hit,
         });
     }
 
     Ok((compute_metrics(&outcomes), outcomes))
+}
+
+struct EvalEnv {
+    prf: Option<String>,
+    graph: Option<String>,
+}
+
+impl EvalEnv {
+    fn apply(disable_prf: bool, disable_graph: bool) -> Self {
+        let env = Self {
+            prf: std::env::var("DORA_DISABLE_PRF").ok(),
+            graph: std::env::var("DORA_DISABLE_GRAPH").ok(),
+        };
+        if disable_prf {
+            std::env::set_var("DORA_DISABLE_PRF", "1");
+        }
+        if disable_graph {
+            std::env::set_var("DORA_DISABLE_GRAPH", "1");
+        }
+        env
+    }
+}
+
+impl Drop for EvalEnv {
+    fn drop(&mut self) {
+        match &self.prf {
+            Some(v) => std::env::set_var("DORA_DISABLE_PRF", v),
+            None => std::env::remove_var("DORA_DISABLE_PRF"),
+        }
+        match &self.graph {
+            Some(v) => std::env::set_var("DORA_DISABLE_GRAPH", v),
+            None => std::env::remove_var("DORA_DISABLE_GRAPH"),
+        }
+    }
 }
 
 fn load_queries(path: &Path) -> Result<EvalFile> {
@@ -171,6 +261,14 @@ fn make_temp_root() -> Result<PathBuf> {
     Ok(root)
 }
 
+fn eval_models_dir(fallback_root: &Path) -> Result<PathBuf> {
+    let dir = dirs::cache_dir()
+        .map(|p| p.join("dora").join("eval-models"))
+        .unwrap_or_else(|| crate::models_dir(fallback_root));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn compute_metrics(outcomes: &[EvalOutcome]) -> EvalMetrics {
     let n = outcomes.len().max(1) as f64;
     let recall_at = |k: usize| -> f64 {
@@ -203,15 +301,24 @@ mod tests {
         let outcomes = vec![
             EvalOutcome {
                 name: "first".to_string(),
+                query: "first query".to_string(),
+                relevant: vec!["a.md".to_string()],
                 rank: Some(1),
+                top_hit: Some("a.md".to_string()),
             },
             EvalOutcome {
                 name: "third".to_string(),
+                query: "third query".to_string(),
+                relevant: vec!["b.md".to_string()],
                 rank: Some(3),
+                top_hit: Some("x.md".to_string()),
             },
             EvalOutcome {
                 name: "miss".to_string(),
+                query: "miss query".to_string(),
+                relevant: vec!["c.md".to_string()],
                 rank: None,
+                top_hit: Some("z.md".to_string()),
             },
         ];
         let metrics = compute_metrics(&outcomes);

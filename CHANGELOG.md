@@ -4,6 +4,22 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-06-02
+
+### Added
+
+- Expanded eval coverage with a broader notes fixture and a separate code-mode
+  fixture. Eval now supports `--top-k`, `--json`, `--disable-prf`, and
+  `--disable-graph` for quick ablations.
+
+### Changed
+
+- Down-weighted PRF in RRF fusion after the expanded notes eval showed equal PRF
+  weighting hurt R@1. Notes fixture R@1 improved from 0.667 to 0.917 while the
+  code fixture stayed at 0.800.
+- Eval runs now use a stable user cache for embedder models instead of downloading
+  into each temporary fixture copy.
+
 ## [0.8.0] — 2026-06-01
 
 The "diagnostics + eval" release. Adds a dev-only committed eval harness, retrieval

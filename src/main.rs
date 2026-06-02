@@ -230,9 +230,21 @@ enum Command {
     Eval {
         /// Fixture directory containing docs/ and queries.toml.
         fixture: PathBuf,
+        /// Number of hits to evaluate per query. Default 5.
+        #[arg(long, default_value_t = 5, value_name = "N")]
+        top_k: usize,
         /// Optional minimum R@1 threshold. Exits nonzero if missed.
         #[arg(long, value_name = "FLOAT")]
         min_r_at_1: Option<f64>,
+        /// Output JSON metrics + per-query outcomes.
+        #[arg(long)]
+        json: bool,
+        /// Disable PRF for this eval run.
+        #[arg(long)]
+        disable_prf: bool,
+        /// Disable graph boost for this eval run.
+        #[arg(long)]
+        disable_graph: bool,
     },
 }
 
@@ -378,8 +390,21 @@ fn main() -> Result<()> {
         #[cfg(debug_assertions)]
         Some(Command::Eval {
             fixture,
+            top_k,
             min_r_at_1,
-        }) => eval::cmd_eval(&fixture, min_r_at_1),
+            json,
+            disable_prf,
+            disable_graph,
+        }) => eval::cmd_eval(
+            &fixture,
+            eval::EvalOptions {
+                top_k,
+                min_r_at_1,
+                json,
+                disable_prf,
+                disable_graph,
+            },
+        ),
         None => {
             let q = cli
                 .query

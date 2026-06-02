@@ -33,6 +33,7 @@ const GRAPH_PPR_DAMPING: f64 = 0.85;
 const PRF_ANN_TOP: usize = 10;
 const PRF_MAX_TERMS: usize = 5;
 const PRF_MIN_TERM_LEN: usize = 3;
+const PRF_RRF_WEIGHT: f64 = 0.25;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HitSignals {
@@ -490,7 +491,12 @@ fn compute_merged_detailed(
             })
     };
 
-    let merged = rrf_merge_n(&[&fts, &ann, &literal, &prf]);
+    let merged = rrf_merge_weighted(&[
+        (&fts, 1.0),
+        (&ann, 1.0),
+        (&literal, 1.0),
+        (&prf, PRF_RRF_WEIGHT),
+    ]);
     Ok(MergedDetails {
         query_vec,
         fts_query,
@@ -675,9 +681,15 @@ fn collapse_per_file(
 /// `1 / (RRF_K + rank)` per occurrence; the top of each list also earns a position bonus
 /// (+0.05 for rank-1, +0.02 for rank-2/3) to sharpen precision. Final list is sorted by
 /// summed score, descending. Bonus values match qmd's published fusion (`tobi/qmd`).
+#[cfg(test)]
 fn rrf_merge_n(lists: &[&[i64]]) -> Vec<(i64, f64)> {
+    let weighted: Vec<(&[i64], f64)> = lists.iter().map(|list| (*list, 1.0)).collect();
+    rrf_merge_weighted(&weighted)
+}
+
+fn rrf_merge_weighted(lists: &[(&[i64], f64)]) -> Vec<(i64, f64)> {
     let mut scores: HashMap<i64, f64> = HashMap::new();
-    for list in lists {
+    for (list, weight) in lists {
         for (rank, id) in list.iter().enumerate() {
             let base = 1.0 / (RRF_K + (rank + 1) as f64);
             let bonus = match rank {
@@ -685,7 +697,7 @@ fn rrf_merge_n(lists: &[&[i64]]) -> Vec<(i64, f64)> {
                 1 | 2 => 0.02,
                 _ => 0.0,
             };
-            *scores.entry(*id).or_insert(0.0) += base + bonus;
+            *scores.entry(*id).or_insert(0.0) += weight * (base + bonus);
         }
     }
     let mut v: Vec<(i64, f64)> = scores.into_iter().collect();

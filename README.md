@@ -44,7 +44,7 @@ Claude > [calls mcp__dora__search]
 
 ## Install
 
-> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux: build from source via `cargo install --git https://github.com/rach/dora --tag v0.8.0`.
+> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux: build from source via `cargo install --git https://github.com/rach/dora --tag v0.8.1`.
 
 ### Homebrew (recommended)
 
@@ -57,7 +57,7 @@ The first run auto-taps `rach/homebrew-dora`. Upgrade with `brew upgrade dora`.
 ### Direct download
 
 ```sh
-curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.8.0-macos-arm64
+curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.8.1-macos-arm64
 chmod +x /tmp/dora
 xattr -d com.apple.quarantine /tmp/dora 2>/dev/null   # bypass macOS Gatekeeper warning
 sudo mv /tmp/dora /usr/local/bin/dora                  # or anywhere on your $PATH
@@ -67,7 +67,7 @@ dora --version
 Either path lands you at:
 
 ```
-dora 0.8.0
+dora 0.8.1
 ```
 
 > **About the Gatekeeper line** (direct-download path only): the binary isn't code-signed (signing requires a $99/yr Apple developer account I haven't paid for). The `xattr` line removes the quarantine flag macOS adds to downloads, so it'll launch without complaining. Homebrew's install path doesn't trip Gatekeeper. If you skip the `xattr` on a direct download, the first run shows *"cannot be opened because the developer cannot be verified"* — right-click in Finder → Open → "Open Anyway" gets past it.
@@ -547,9 +547,13 @@ dora --json explain "why does the opening sentence matter" | jq .
 Committed retrieval eval harness for contributors. It exists in dev/debug builds
 (`cargo run -- eval fixtures/eval/notes`) and is compiled out of release binaries.
 Fixtures contain `docs/` plus a `queries.toml`; dora reports R@1, R@3, R@5, and MRR.
+Use the ablation flags to test whether PRF or graph boost helped a fixture.
 
 ```sh
 cargo run -- eval fixtures/eval/notes
+cargo run -- eval fixtures/eval/code
+cargo run -- eval fixtures/eval/notes --disable-prf
+cargo run -- eval fixtures/eval/notes --disable-graph --json
 cargo run -- eval fixtures/eval/notes --min-r-at-1 0.8
 ```
 

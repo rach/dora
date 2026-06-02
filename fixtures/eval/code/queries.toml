@@ -1,0 +1,25 @@
+[[query]]
+name = "rate-limit-middleware"
+query = "request rate limiting middleware"
+relevant = ["src/rate_limit.rs"]
+
+[[query]]
+name = "parse-bearer-token"
+query = "extract bearer token from authorization header"
+relevant = ["src/auth.rs"]
+
+[[query]]
+name = "route-dispatch"
+query = "dispatch incoming request to handlers"
+relevant = ["src/router.rs"]
+
+[[query]]
+name = "json-error-response"
+query = "return json error response"
+relevant = ["src/response.rs"]
+
+[[query]]
+name = "process-request-definition"
+query = "process request entry point"
+relevant = ["src/router.rs"]
+

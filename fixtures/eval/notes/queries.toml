@@ -13,3 +13,47 @@ name = "call-graph"
 query = "where do symbol callers and definitions help agents"
 relevant = ["engineering/code-navigation.md"]
 
+[[query]]
+name = "shell-wrapper-fallback"
+query = "when should grep and rg keep normal behavior"
+relevant = ["product/wrappers.md"]
+
+[[query]]
+name = "meeting-decisions"
+query = "capture decisions and owners after a meeting"
+relevant = ["workflows/meeting-notes.md"]
+
+[[query]]
+name = "index-freshness"
+query = "keep search results fresh after files change"
+relevant = ["engineering/freshness.md"]
+
+[[query]]
+name = "privacy-default"
+query = "why keep memory local by default"
+relevant = ["product/privacy.md"]
+
+[[query]]
+name = "transcript-recall"
+query = "find an old assistant session by what happened"
+relevant = ["agents/transcripts.md"]
+
+[[query]]
+name = "ranking-signals"
+query = "debug why a retrieval result ranked first"
+relevant = ["engineering/explainability.md"]
+
+[[query]]
+name = "eval-harness"
+query = "measure recall and mrr with fixture queries"
+relevant = ["engineering/evaluation.md"]
+
+[[query]]
+name = "graph-related-notes"
+query = "linked notes and related passages should boost each other"
+relevant = ["engineering/document-graph.md"]
+
+[[query]]
+name = "openai-optional"
+query = "use cloud embeddings only when explicitly configured"
+relevant = ["configuration/embedders.md"]
