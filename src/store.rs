@@ -9,13 +9,12 @@ use rusqlite::{params, params_from_iter, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 
+#[allow(clippy::missing_transmute_annotations)]
 pub fn init_sqlite_vec() {
     use rusqlite::ffi::sqlite3_auto_extension;
     use sqlite_vec::sqlite3_vec_init;
     unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )));
+        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
     }
 }
 
@@ -53,7 +52,6 @@ pub struct LinkRow<'a> {
 /// Snapshot of a `files` row, used by the diff loop to decide insert/update/touch/skip.
 #[derive(Debug, Clone)]
 pub struct FileRow {
-    pub id: i64,
     pub mtime: u64,
     pub size: u64,
     pub content_hash: String,
@@ -97,7 +95,6 @@ pub struct OutlineEntry {
     pub symbol: String,
     pub kind: String,
     pub heading_path: String,
-    pub start_byte: usize,
 }
 
 impl Store {
@@ -210,7 +207,6 @@ impl Store {
             .conn
             .prepare("SELECT id, path, mtime, size, content_hash FROM files")?;
         let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
             let path: String = row.get(1)?;
             let mtime: i64 = row.get(2)?;
             let size: i64 = row.get(3)?;
@@ -218,7 +214,6 @@ impl Store {
             Ok((
                 path,
                 FileRow {
-                    id,
                     mtime: mtime as u64,
                     size: size as u64,
                     content_hash,
@@ -353,10 +348,15 @@ impl Store {
             // arm of RRF is blind to queries that match section titles (e.g. "Setting Up
             // a New Project" when the body never repeats those words verbatim). Measured
             // on rust-book/src: R@1 0.57 → 0.74, MRR 0.73 → 0.86, 21 wins / 0 regressions.
+            let alias_text = c
+                .symbol
+                .filter(|_| c.kind != "prose")
+                .map(|sym| crate::chunk::symbol_alias_text(c.heading_path, sym))
+                .unwrap_or_default();
             let fts_text = if c.heading_path.is_empty() {
-                c.content.to_string()
+                format!("{}\n{}", alias_text, c.content)
             } else {
-                format!("{}\n{}", c.heading_path, c.content)
+                format!("{}\n{}\n{}", c.heading_path, alias_text, c.content)
             };
             tx.execute(
                 "INSERT INTO chunks_fts (rowid, content) VALUES (?, ?)",
@@ -388,7 +388,7 @@ impl Store {
                     within_file,
                     link.target_symbol,
                     link.target_path,
-                    if within_file.is_some() { "exact" } else { "exact" },
+                    "exact",
                 ],
             )?;
         }
@@ -516,12 +516,18 @@ impl Store {
                         .map(|(id, _)| *id)
                         .collect();
                     if hits.is_empty() {
-                        title_map.get(&title.to_lowercase()).cloned().unwrap_or_default()
+                        title_map
+                            .get(&title.to_lowercase())
+                            .cloned()
+                            .unwrap_or_default()
                     } else {
                         hits
                     }
                 }
-                None => title_map.get(&title.to_lowercase()).cloned().unwrap_or_default(),
+                None => title_map
+                    .get(&title.to_lowercase())
+                    .cloned()
+                    .unwrap_or_default(),
             };
             if candidates.is_empty() {
                 continue; // dangling link — leave target_chunk_id NULL
@@ -532,7 +538,11 @@ impl Store {
             let Some(&chunk_id) = chunk0.get(&target_file) else {
                 continue;
             };
-            let confidence = if candidates.len() == 1 { "exact" } else { "name_match" };
+            let confidence = if candidates.len() == 1 {
+                "exact"
+            } else {
+                "name_match"
+            };
             tx.execute(
                 "UPDATE links SET target_chunk_id = ?, confidence = ? WHERE id = ?",
                 params![chunk_id, confidence, link_id],
@@ -615,9 +625,10 @@ impl Store {
 
     /// Remove a context entry. Returns true iff a row was deleted.
     pub fn remove_context(&self, path_prefix: &str) -> Result<bool> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM contexts WHERE path_prefix = ?", params![path_prefix])?;
+        let affected = self.conn.execute(
+            "DELETE FROM contexts WHERE path_prefix = ?",
+            params![path_prefix],
+        )?;
         Ok(affected > 0)
     }
 
@@ -626,7 +637,9 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT path_prefix, description FROM contexts ORDER BY path_prefix")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -639,8 +652,8 @@ impl Store {
     ///   * `path_prefix = "/api"` — matches any path whose first segment is `api/...` (we
     ///     normalize the searched path with a leading `/` first, since chunk paths are
     ///     stored relative to the source root without one).
-    /// Subtree match requires a `/` boundary so `/foo` doesn't accidentally match `/foobar`.
-    /// Longer prefix wins ties so a subtree context overrides the global one.
+    ///     Subtree match requires a `/` boundary so `/foo` doesn't accidentally match `/foobar`.
+    ///     Longer prefix wins ties so a subtree context overrides the global one.
     pub fn context_for(&self, path: &str) -> Result<Option<String>> {
         // Cheap fast-path: skip the SELECT when no contexts are registered. Worth it because
         // this runs once per Hit, and the typical source has zero contexts configured.
@@ -737,6 +750,17 @@ impl Store {
     // ---------- code-aware lookups (sub-slice E) ----------
 
     pub fn find_definitions(&self, symbol: &str, limit: usize) -> Result<Vec<DefinitionHit>> {
+        let mut out = self.find_exact_definitions(symbol, limit)?;
+        if out.len() >= limit {
+            return Ok(out);
+        }
+        let mut aliases = self.find_alias_definitions(symbol, limit - out.len())?;
+        aliases.retain(|hit| !out.iter().any(|exact| exact.chunk_id == hit.chunk_id));
+        out.extend(aliases);
+        Ok(out)
+    }
+
+    fn find_exact_definitions(&self, symbol: &str, limit: usize) -> Result<Vec<DefinitionHit>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.heading_path, c.content, c.start_byte, c.kind, c.symbol, f.path \
              FROM chunks c JOIN files f ON f.id = c.file_id \
@@ -761,14 +785,43 @@ impl Store {
         Ok(out)
     }
 
+    fn find_alias_definitions(&self, symbol: &str, limit: usize) -> Result<Vec<DefinitionHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.heading_path, c.content, c.start_byte, c.kind, c.symbol, f.path \
+             FROM chunks c JOIN files f ON f.id = c.file_id \
+             WHERE c.symbol IS NOT NULL AND c.kind NOT IN ('prose') \
+             ORDER BY f.path, c.chunk_idx",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DefinitionHit {
+                chunk_id: row.get(0)?,
+                heading_path: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                content: row.get(2)?,
+                start_byte: row.get::<_, i64>(3)? as usize,
+                kind: row.get(4)?,
+                symbol: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                path: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let hit = row?;
+            if crate::chunk::symbol_matches_alias(&hit.symbol, symbol) {
+                out.push(hit);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Direct callers (depth=1) and transitive callers (depth>1). Uses a recursive CTE so
     /// the call doesn't N+1 across depth levels.
-    pub fn find_callers(
-        &self,
-        symbol: &str,
-        depth: usize,
-        limit: usize,
-    ) -> Result<Vec<CallerHit>> {
+    pub fn find_callers(&self, symbol: &str, depth: usize, limit: usize) -> Result<Vec<CallerHit>> {
         let depth = depth.clamp(1, 5);
         // The CTE walks: start at any chunk whose symbol matches → follow incoming `calls`
         // edges → expand up to `depth` hops. Each visited caller gets emitted with its
@@ -816,11 +869,7 @@ impl Store {
         Ok(out)
     }
 
-    pub fn find_implementations(
-        &self,
-        symbol: &str,
-        limit: usize,
-    ) -> Result<Vec<DefinitionHit>> {
+    pub fn find_implementations(&self, symbol: &str, limit: usize) -> Result<Vec<DefinitionHit>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT c.id, c.heading_path, c.content, c.start_byte, c.kind, c.symbol, f.path \
              FROM links l \
@@ -853,12 +902,11 @@ impl Store {
         if file_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat("?")
-            .take(file_ids.len())
+        let placeholders = std::iter::repeat_n("?", file_ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT f.path, f.id, c.symbol, c.kind, c.heading_path, c.start_byte \
+            "SELECT f.path, f.id, c.symbol, c.kind, c.heading_path \
              FROM chunks c JOIN files f ON f.id = c.file_id \
              WHERE c.file_id IN ({placeholders}) \
                AND c.symbol IS NOT NULL AND c.symbol != '' \
@@ -872,7 +920,6 @@ impl Store {
                 symbol: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 kind: row.get(3)?,
                 heading_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                start_byte: row.get::<_, i64>(5)? as usize,
             })
         })?;
         let mut out = Vec::new();
@@ -896,8 +943,8 @@ impl Store {
                     "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? \
                      ORDER BY bm25(chunks_fts) LIMIT ?",
                 )?;
-                let rows = stmt
-                    .query_map(params![query, limit as i64], |row| row.get::<_, i64>(0))?;
+                let rows =
+                    stmt.query_map(params![query, limit as i64], |row| row.get::<_, i64>(0))?;
                 let mut hits = Vec::new();
                 for r in rows {
                     hits.push(r?);
@@ -944,8 +991,8 @@ impl Store {
                     "SELECT id FROM chunks WHERE content LIKE ? ESCAPE '\\' \
                      ORDER BY id LIMIT ?",
                 )?;
-                let rows = stmt
-                    .query_map(params![pattern, limit as i64], |row| row.get::<_, i64>(0))?;
+                let rows =
+                    stmt.query_map(params![pattern, limit as i64], |row| row.get::<_, i64>(0))?;
                 let mut hits = Vec::new();
                 for r in rows {
                     hits.push(r?);
@@ -985,8 +1032,8 @@ impl Store {
                     "SELECT chunk_id FROM chunks_vec WHERE embedding MATCH ? \
                      ORDER BY distance LIMIT ?",
                 )?;
-                let rows = stmt
-                    .query_map(params![bytes, limit as i64], |row| row.get::<_, i64>(0))?;
+                let rows =
+                    stmt.query_map(params![bytes, limit as i64], |row| row.get::<_, i64>(0))?;
                 let mut hits = Vec::new();
                 for r in rows {
                     hits.push(r?);
@@ -1009,10 +1056,10 @@ impl Store {
                      WHERE f.path LIKE ? \
                      ORDER BY v.distance LIMIT ?",
                 )?;
-                let rows = stmt.query_map(
-                    params![bytes, inner_limit, like, limit as i64],
-                    |row| row.get::<_, i64>(0),
-                )?;
+                let rows = stmt
+                    .query_map(params![bytes, inner_limit, like, limit as i64], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
                 let mut hits = Vec::new();
                 for r in rows {
                     hits.push(r?);
@@ -1026,6 +1073,7 @@ impl Store {
 
     /// Read a chunk's stored embedding back out of the sqlite-vec virtual table, decoded to
     /// f32. Used to build the kNN similarity graph. Returns None if the chunk has no vector.
+    #[cfg(test)]
     pub fn fetch_chunk_embedding(&self, chunk_id: i64) -> Result<Option<Vec<f32>>> {
         let blob: rusqlite::Result<Vec<u8>> = self.conn.query_row(
             "SELECT embedding FROM chunks_vec WHERE chunk_id = ?",
@@ -1044,9 +1092,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT chunk_id, embedding FROM chunks_vec")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
         let mut out = Vec::new();
         for r in rows {
             let (id, blob) = r?;
@@ -1057,7 +1103,9 @@ impl Store {
 
     /// Every (chunk_id, content) pair, for keyphrase extraction over the corpus.
     pub fn all_chunks_for_graph(&self) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, content FROM chunks ORDER BY id")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM chunks ORDER BY id")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for r in rows {
@@ -1091,6 +1139,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn count_graph_edges(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -1125,7 +1174,11 @@ impl Store {
             .conn
             .prepare("SELECT src_chunk_id, dst_chunk_id, kind FROM graph_edges")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         for r in rows {
             let (s, d, kind) = r?;
@@ -1177,8 +1230,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = std::iter::repeat("?")
-            .take(ids.len())
+        let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("SELECT id, file_id FROM chunks WHERE id IN ({placeholders})");
@@ -1261,8 +1313,12 @@ mod tests {
                 parent_chunk_idx: None,
             }
         }
-        store.upsert_file_with_chunks("a.md", 1, 4, "ha", &[row("alpha", &emb_a)], &[]).unwrap();
-        store.upsert_file_with_chunks("b.md", 1, 4, "hb", &[row("beta", &emb_b)], &[]).unwrap();
+        store
+            .upsert_file_with_chunks("a.md", 1, 4, "ha", &[row("alpha", &emb_a)], &[])
+            .unwrap();
+        store
+            .upsert_file_with_chunks("b.md", 1, 4, "hb", &[row("beta", &emb_b)], &[])
+            .unwrap();
 
         // Find the two chunk ids.
         let all = store.all_chunk_embeddings().unwrap();
@@ -1270,18 +1326,58 @@ mod tests {
         for (_, v) in &all {
             assert_eq!(v.len(), 4, "decoded vector has the right dim");
         }
-        let (id_a, vec_a) = all.iter().find(|(_, v)| (v[0] - 0.1).abs() < 1e-4).cloned().unwrap();
+        let (id_a, vec_a) = all
+            .iter()
+            .find(|(_, v)| (v[0] - 0.1).abs() < 1e-4)
+            .cloned()
+            .unwrap();
         // Round-trip tolerance: sqlite-vec stores f32, so this is exact-ish.
-        assert!((vec_a[3] - 0.4).abs() < 1e-4, "fetched vector matches stored");
+        assert!(
+            (vec_a[3] - 0.4).abs() < 1e-4,
+            "fetched vector matches stored"
+        );
         let single = store.fetch_chunk_embedding(id_a).unwrap().unwrap();
         assert_eq!(single, vec_a);
 
         // graph_edges CRUD.
         let (id_b, _) = all.iter().find(|(id, _)| *id != id_a).cloned().unwrap();
-        store.insert_graph_edges(&[(id_a, id_b, "similarity", 0.3)]).unwrap();
+        store
+            .insert_graph_edges(&[(id_a, id_b, "similarity", 0.3)])
+            .unwrap();
         assert_eq!(store.count_graph_edges().unwrap(), 1);
         store.clear_graph_edges().unwrap();
         assert_eq!(store.count_graph_edges().unwrap(), 0);
+    }
+
+    #[test]
+    fn find_definitions_matches_symbol_aliases_after_exact_hits() {
+        init_sqlite_vec();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("aliases.db");
+        let mut store = Store::open(&db, 4).unwrap();
+        let emb = vec![0.0f32, 0.0, 0.0, 0.0];
+        let rows = vec![ChunkRow {
+            idx: 0,
+            heading_path: "Store",
+            content: "fn processRequest() {}",
+            start_byte: 0,
+            end_byte: 22,
+            embedding: &emb,
+            kind: "function",
+            symbol: Some("processRequest"),
+            parent_chunk_idx: None,
+        }];
+        store
+            .upsert_file_with_chunks("src/store.rs", 1, 22, "hash", &rows, &[])
+            .unwrap();
+
+        let exact = store.find_definitions("processRequest", 10).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].symbol, "processRequest");
+
+        let alias = store.find_definitions("process request", 10).unwrap();
+        assert_eq!(alias.len(), 1);
+        assert_eq!(alias[0].symbol, "processRequest");
     }
 
     /// Wikilink edges resolve by note title/path to the target's chunk 0, and backlinks /
@@ -1311,27 +1407,64 @@ mod tests {
 
         // "index.md" links to [[Target]] (title), [[sub/Deep]] (path), and [[Ghost]] (dangling).
         let links = vec![
-            LinkRow { source_chunk_idx: 0, kind: "wikilink", target_symbol: "Target", target_path: None },
-            LinkRow { source_chunk_idx: 0, kind: "wikilink", target_symbol: "Deep", target_path: Some("sub/Deep") },
-            LinkRow { source_chunk_idx: 0, kind: "wikilink", target_symbol: "Ghost", target_path: None },
+            LinkRow {
+                source_chunk_idx: 0,
+                kind: "wikilink",
+                target_symbol: "Target",
+                target_path: None,
+            },
+            LinkRow {
+                source_chunk_idx: 0,
+                kind: "wikilink",
+                target_symbol: "Deep",
+                target_path: Some("sub/Deep"),
+            },
+            LinkRow {
+                source_chunk_idx: 0,
+                kind: "wikilink",
+                target_symbol: "Ghost",
+                target_path: None,
+            },
         ];
-        store.upsert_file_with_chunks("index.md", 1, 10, "h1", &[row("see links", &emb)], &links).unwrap();
-        store.upsert_file_with_chunks("Target.md", 1, 10, "h2", &[row("i am the target", &emb)], &[]).unwrap();
-        store.upsert_file_with_chunks("sub/Deep.md", 1, 10, "h3", &[row("deep note", &emb)], &[]).unwrap();
+        store
+            .upsert_file_with_chunks("index.md", 1, 10, "h1", &[row("see links", &emb)], &links)
+            .unwrap();
+        store
+            .upsert_file_with_chunks(
+                "Target.md",
+                1,
+                10,
+                "h2",
+                &[row("i am the target", &emb)],
+                &[],
+            )
+            .unwrap();
+        store
+            .upsert_file_with_chunks("sub/Deep.md", 1, 10, "h3", &[row("deep note", &emb)], &[])
+            .unwrap();
 
         let resolved = store.resolve_wikilinks().unwrap();
         assert_eq!(resolved, 2, "Target + Deep resolve; Ghost dangles");
 
         // Backlinks of the two real targets point back to index.md.
-        assert_eq!(store.backlinks("Target.md").unwrap(), vec!["index.md".to_string()]);
-        assert_eq!(store.backlinks("sub/Deep.md").unwrap(), vec!["index.md".to_string()]);
+        assert_eq!(
+            store.backlinks("Target.md").unwrap(),
+            vec!["index.md".to_string()]
+        );
+        assert_eq!(
+            store.backlinks("sub/Deep.md").unwrap(),
+            vec!["index.md".to_string()]
+        );
         // Ghost.md doesn't exist → no backlinks.
         assert!(store.backlinks("Ghost.md").unwrap().is_empty());
 
         // Forward links of index.md are the two resolved targets.
         let mut fwd = store.forward_links("index.md").unwrap();
         fwd.sort();
-        assert_eq!(fwd, vec!["Target.md".to_string(), "sub/Deep.md".to_string()]);
+        assert_eq!(
+            fwd,
+            vec!["Target.md".to_string(), "sub/Deep.md".to_string()]
+        );
     }
 
     /// FTS must see `heading_path` so queries matching a section title still hit the chunk
@@ -1407,10 +1540,7 @@ mod tests {
             "RRF-specific notes"
         );
         assert_eq!(
-            store
-                .context_for("technology/other.md")
-                .unwrap()
-                .unwrap(),
+            store.context_for("technology/other.md").unwrap().unwrap(),
             "Engineering nuggets"
         );
         assert_eq!(
@@ -1440,7 +1570,9 @@ mod tests {
         let store = Store::open(&db, 4).unwrap();
 
         let emb = vec![0.1f32, 0.2, 0.3, 0.4];
-        let usage_id = store.log_usage("how to track ICP", &emb, "[1,2,3]").unwrap();
+        let usage_id = store
+            .log_usage("how to track ICP", &emb, "[1,2,3]")
+            .unwrap();
         assert!(usage_id > 0);
 
         // Matching query within window → attribution succeeds.
@@ -1505,7 +1637,11 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count2, MIGRATIONS.len() as i64, "migrations must be idempotent");
+        assert_eq!(
+            count2,
+            MIGRATIONS.len() as i64,
+            "migrations must be idempotent"
+        );
 
         // Confirm migration #1 created the contexts table.
         let table_exists: i64 = store2

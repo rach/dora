@@ -4,6 +4,31 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-06-01
+
+The "diagnostics + eval" release. Adds a dev-only committed eval harness, retrieval
+explainability, and code-symbol aliasing while keeping the release binary single-purpose.
+
+### Added
+
+- **`dora explain "query"`** for retrieval diagnostics. Shows FTS query, PRF terms,
+  per-arm top hits, graph boost contribution, and final fused ranking. `--json`
+  emits the same diagnostics as structured data.
+- **`--signals`** for JSON search output. Adds optional per-hit retrieval signals
+  (`fts_rank`, `ann_rank`, `literal_rank`, `prf_rank`, `graph_boost`, `final_score`)
+  without changing normal pretty output.
+- **Dev-only `dora eval <fixture-dir>`** compiled in debug builds and omitted from
+  release binaries. The committed `fixtures/eval/notes` fixture reports R@1, R@3,
+  R@5, and MRR, with optional `--min-r-at-1` gating.
+
+### Changed
+
+- **Code symbol aliases** are indexed for better retrieval without changing canonical
+  `chunks.symbol` values. CamelCase, snake/kebab, and simple qualified forms are fed
+  into FTS/embedding text and alias-aware `find_definition` fallback.
+- **Chunker version bumped to 4** so existing indexes rebuild with alias-enriched
+  searchable text.
+
 ## [0.7.0] — 2026-05-30
 
 The "graph + boolean" release. Two big additions, both in service of *finding things

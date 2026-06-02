@@ -8,13 +8,13 @@
 
 use anyhow::{Context, Result};
 use rmcp::{
-    ErrorData, RoleServer, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
     },
     service::{MaybeSendFuture, RequestContext},
     transport::stdio,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -239,6 +239,7 @@ struct RecentSearch {
     ts: i64,
 }
 
+#[derive(Default)]
 struct MultiSourceState {
     sources: HashMap<String, SourceState>,
     /// Stable ordered list of source names — matches insertion order for deterministic
@@ -256,11 +257,7 @@ struct DoraServer {
 
 impl ServerHandler for DoraServer {
     fn get_info(&self) -> ServerInfo {
-        let instructions = self
-            .state
-            .lock()
-            .ok()
-            .map(|s| build_instructions(&s));
+        let instructions = self.state.lock().ok().map(|s| build_instructions(&s));
 
         let mut impl_info = Implementation::new("dora", env!("CARGO_PKG_VERSION"));
         impl_info.title = Some("dora — local semantic memory".to_string());
@@ -280,7 +277,8 @@ impl ServerHandler for DoraServer {
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_
+    {
         let state = self.state.clone();
         async move {
             // Build the source-listing snippet for the `search` tool's `source` parameter
@@ -380,7 +378,13 @@ impl ServerHandler for DoraServer {
 
             Ok(ListToolsResult {
                 tools: vec![
-                    search, list, find_def, find_callers, find_impls, repo_map, multi_get,
+                    search,
+                    list,
+                    find_def,
+                    find_callers,
+                    find_impls,
+                    repo_map,
+                    multi_get,
                     backlinks,
                 ],
                 ..Default::default()
@@ -392,7 +396,8 @@ impl ServerHandler for DoraServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + MaybeSendFuture + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + MaybeSendFuture + '_
+    {
         let state = self.state.clone();
         async move {
             match request.name.as_ref() {
@@ -449,6 +454,7 @@ async fn handle_search(
         output,
         and_queries: args.and.unwrap_or_default(),
         not_queries: args.not.unwrap_or_default(),
+        diagnostics: false,
     };
 
     let mut guard = state
@@ -469,8 +475,9 @@ async fn handle_search(
             search_one(s, &args.query, opts.clone())
                 .map_err(|e| ErrorData::internal_error(format!("search failed: {e}"), None))?
         }
-        None => search_cross(multi, &args.query, opts.clone())
-            .map_err(|e| ErrorData::internal_error(format!("cross-source search failed: {e}"), None))?,
+        None => search_cross(multi, &args.query, opts.clone()).map_err(|e| {
+            ErrorData::internal_error(format!("cross-source search failed: {e}"), None)
+        })?,
     };
 
     // Stash this search in the ring buffer so a subsequent `multi_get` can attribute reads
@@ -478,7 +485,10 @@ async fn handle_search(
     // group by that so cross-source searches still attribute correctly.
     let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
     for h in &hits {
-        by_source.entry(h.source.clone()).or_default().push(h.path.clone());
+        by_source
+            .entry(h.source.clone())
+            .or_default()
+            .push(h.path.clone());
     }
     for (src, paths) in by_source {
         multi.record_search(&src, &args.query, paths);
@@ -539,7 +549,8 @@ fn parse_args<T: for<'de> serde::Deserialize<'de>>(
         .arguments
         .map(serde_json::Value::Object)
         .unwrap_or(serde_json::Value::Null);
-    serde_json::from_value(v).map_err(|e| ErrorData::invalid_params(format!("bad arguments: {e}"), None))
+    serde_json::from_value(v)
+        .map_err(|e| ErrorData::invalid_params(format!("bad arguments: {e}"), None))
 }
 
 async fn handle_find_definition(
@@ -550,7 +561,10 @@ async fn handle_find_definition(
     let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
     let symbol = args.symbol.trim().to_string();
     if symbol.is_empty() {
-        return Err(ErrorData::invalid_params("symbol must not be empty".to_string(), None));
+        return Err(ErrorData::invalid_params(
+            "symbol must not be empty".to_string(),
+            None,
+        ));
     }
 
     let mut guard = state
@@ -561,7 +575,10 @@ async fn handle_find_definition(
         Some(n) => {
             if !guard.sources.contains_key(n) {
                 return Err(ErrorData::invalid_params(
-                    format!("unknown source '{n}'. registered: {}", guard.order.join(", ")),
+                    format!(
+                        "unknown source '{n}'. registered: {}",
+                        guard.order.join(", ")
+                    ),
                     None,
                 ));
             }
@@ -609,7 +626,10 @@ async fn handle_find_callers(
     let depth = args.depth.unwrap_or(1).clamp(1, 5) as usize;
     let symbol = args.symbol.trim().to_string();
     if symbol.is_empty() {
-        return Err(ErrorData::invalid_params("symbol must not be empty".to_string(), None));
+        return Err(ErrorData::invalid_params(
+            "symbol must not be empty".to_string(),
+            None,
+        ));
     }
 
     let mut guard = state
@@ -620,7 +640,10 @@ async fn handle_find_callers(
         Some(n) => {
             if !guard.sources.contains_key(n) {
                 return Err(ErrorData::invalid_params(
-                    format!("unknown source '{n}'. registered: {}", guard.order.join(", ")),
+                    format!(
+                        "unknown source '{n}'. registered: {}",
+                        guard.order.join(", ")
+                    ),
                     None,
                 ));
             }
@@ -666,7 +689,10 @@ async fn handle_find_implementations(
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as usize;
     let symbol = args.symbol.trim().to_string();
     if symbol.is_empty() {
-        return Err(ErrorData::invalid_params("symbol must not be empty".to_string(), None));
+        return Err(ErrorData::invalid_params(
+            "symbol must not be empty".to_string(),
+            None,
+        ));
     }
 
     let mut guard = state
@@ -677,7 +703,10 @@ async fn handle_find_implementations(
         Some(n) => {
             if !guard.sources.contains_key(n) {
                 return Err(ErrorData::invalid_params(
-                    format!("unknown source '{n}'. registered: {}", guard.order.join(", ")),
+                    format!(
+                        "unknown source '{n}'. registered: {}",
+                        guard.order.join(", ")
+                    ),
                     None,
                 ));
             }
@@ -725,7 +754,11 @@ async fn handle_repo_map(
         .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
     if !guard.sources.contains_key(&args.source) {
         return Err(ErrorData::invalid_params(
-            format!("unknown source '{}'. registered: {}", args.source, guard.order.join(", ")),
+            format!(
+                "unknown source '{}'. registered: {}",
+                args.source,
+                guard.order.join(", ")
+            ),
             None,
         ));
     }
@@ -746,9 +779,10 @@ async fn handle_repo_map(
     let mut files_emitted: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     let char_budget = token_budget * 4;
 
-    let entries = s.store.definitions_in_files(&file_ids).map_err(|e| {
-        ErrorData::internal_error(format!("definitions_in_files: {e}"), None)
-    })?;
+    let entries = s
+        .store
+        .definitions_in_files(&file_ids)
+        .map_err(|e| ErrorData::internal_error(format!("definitions_in_files: {e}"), None))?;
     let by_file: std::collections::HashMap<i64, Vec<&crate::store::OutlineEntry>> = entries
         .iter()
         .fold(std::collections::HashMap::new(), |mut acc, e| {
@@ -908,11 +942,10 @@ fn attribute_reads(multi: &mut MultiSourceState, source: &str, entries: &[MultiG
             Ok(Some(id)) => id,
             _ => continue,
         };
-        if let Err(err) = s.store.mark_used_by_query(
-            &rs.query,
-            chunk_id,
-            USE_ATTRIBUTION_WINDOW_SECS,
-        ) {
+        if let Err(err) =
+            s.store
+                .mark_used_by_query(&rs.query, chunk_id, USE_ATTRIBUTION_WINDOW_SECS)
+        {
             eprintln!("dora mcp: mark_used_by_query failed: {err}");
         }
     }
@@ -974,12 +1007,14 @@ fn search_one(
     opts: crate::search::SearchOptions<'_>,
 ) -> Result<Vec<crate::search::Hit>> {
     crate::search_with_self_heal(
-        &s.path,
-        &s.name,
-        &s.cfg,
-        &mut s.store,
-        &s.chunker,
-        s.embedder.as_ref(),
+        crate::SearchRuntime {
+            source_root: &s.path,
+            source_name: &s.name,
+            cfg: &s.cfg,
+            store: &mut s.store,
+            chunker: &s.chunker,
+            embedder: s.embedder.as_ref(),
+        },
         query,
         opts,
     )
@@ -1013,7 +1048,11 @@ fn search_cross(
             }
         }
     }
-    all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     if !opts.all {
         all.truncate(opts.top_k);
     }
@@ -1061,10 +1100,7 @@ pub async fn run_multi(registry: Registry, transport: Transport) -> Result<()> {
 /// JSON endpoint that `dora doctor` + the daemon-detection helpers in `install.rs` use.
 /// State (the `Arc<Mutex<MultiSourceState>>`) is captured by the service factory closure,
 /// so all sessions share one MultiSourceState — embedders + Stores stay resident.
-async fn run_http(
-    state: Arc<Mutex<MultiSourceState>>,
-    bind: std::net::SocketAddr,
-) -> Result<()> {
+async fn run_http(state: Arc<Mutex<MultiSourceState>>, bind: std::net::SocketAddr) -> Result<()> {
     use axum::routing::get;
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
@@ -1078,7 +1114,11 @@ async fn run_http(
 
     let factory_state = state.clone();
     let svc = StreamableHttpService::new(
-        move || Ok(DoraServer { state: factory_state.clone() }),
+        move || {
+            Ok(DoraServer {
+                state: factory_state.clone(),
+            })
+        },
         session_manager,
         config,
     );
@@ -1137,7 +1177,9 @@ fn health_payload(
 /// one-entry registry and reuses `run_multi`'s implementation. Always stdio — single-source
 /// is a one-off interactive path; HTTP daemon is meant for the multi-source registry.
 pub async fn run(source_root: &Path) -> Result<()> {
-    let source_root = source_root.canonicalize().context("canonicalize source path")?;
+    let source_root = source_root
+        .canonicalize()
+        .context("canonicalize source path")?;
     let name = source_root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1180,10 +1222,7 @@ fn build_state(sources: &[Source]) -> Result<MultiSourceState> {
     })
 }
 
-fn try_load_source(
-    src: &Source,
-    cache: &mut HashMap<String, DynEmbedder>,
-) -> Result<SourceState> {
+fn try_load_source(src: &Source, cache: &mut HashMap<String, DynEmbedder>) -> Result<SourceState> {
     let path = src
         .path
         .canonicalize()
@@ -1219,16 +1258,6 @@ fn try_load_source(
         chunker,
         store,
     })
-}
-
-impl Default for MultiSourceState {
-    fn default() -> Self {
-        Self {
-            sources: HashMap::new(),
-            order: Vec::new(),
-            recent_searches: std::collections::VecDeque::new(),
-        }
-    }
 }
 
 impl MultiSourceState {
@@ -1354,10 +1383,7 @@ fn build_search_schema(source_summary: &str) -> serde_json::Map<String, serde_js
 fn log_ready(state: &MultiSourceState) {
     eprintln!("dora mcp: ready with {} source(s):", state.order.len());
     for name in &state.order {
-        let s = state
-            .sources
-            .get(name)
-            .expect("name in order map exists");
+        let s = state.sources.get(name).expect("name in order map exists");
         eprintln!(
             "  - {} ({}, model={})",
             s.name,

@@ -120,8 +120,7 @@ pub fn registry_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var(ENV_REGISTRY) {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not determine $HOME"))?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine $HOME"))?;
     Ok(home.join(".config").join("dora").join(REGISTRY_FILENAME))
 }
 

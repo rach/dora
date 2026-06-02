@@ -83,7 +83,7 @@ fn keyphrase_edges(chunks: &[(i64, String)], out: &mut Vec<(i64, i64, &'static s
 
     // pair -> shared salient-word count
     let mut pair_weight: HashMap<(i64, i64), f64> = HashMap::new();
-    for (_term, ids) in &inverted {
+    for ids in inverted.values() {
         if ids.len() < 2 || ids.len() > PHRASE_DF_CAP {
             continue; // singletons add no edge; hub words add noise
         }
@@ -113,7 +113,7 @@ fn keyphrases(text: &str, top_n: usize) -> Vec<String> {
     // Candidate phrases: runs of content words, broken by stopwords / non-alphanumeric.
     let mut phrases: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
-    let mut flush = |cur: &mut Vec<String>, out: &mut Vec<Vec<String>>| {
+    let flush = |cur: &mut Vec<String>, out: &mut Vec<Vec<String>>| {
         if !cur.is_empty() {
             out.push(std::mem::take(cur));
         }
@@ -153,10 +153,7 @@ fn keyphrases(text: &str, top_n: usize) -> Vec<String> {
         if phrase.len() < KEYPHRASE_MIN_LEN || !seen.insert(phrase.clone()) {
             continue;
         }
-        let score: f64 = p
-            .iter()
-            .map(|w| degree[w] as f64 / freq[w] as f64)
-            .sum();
+        let score: f64 = p.iter().map(|w| degree[w] as f64 / freq[w] as f64).sum();
         scored.push((phrase, score));
     }
     scored.sort_by(|a, b| {
@@ -186,7 +183,9 @@ fn similarity_edges(store: &Store, out: &mut Vec<(i64, i64, &'static str, f64)>)
             if nb == *id {
                 continue;
             }
-            let Some(nbvec) = by_id.get(&nb) else { continue };
+            let Some(nbvec) = by_id.get(&nb) else {
+                continue;
+            };
             let cos = cosine(vec, nbvec);
             if cos < SIM_THRESHOLD {
                 continue;
@@ -253,15 +252,26 @@ mod tests {
     #[test]
     fn keyphrase_edges_connect_chunks_sharing_a_phrase() {
         let chunks = vec![
-            (1i64, "Series A fundraising memo for the investor round".to_string()),
-            (2i64, "The investor round closes after fundraising diligence".to_string()),
-            (3i64, "Unrelated note about kubernetes pod scheduling".to_string()),
+            (
+                1i64,
+                "Series A fundraising memo for the investor round".to_string(),
+            ),
+            (
+                2i64,
+                "The investor round closes after fundraising diligence".to_string(),
+            ),
+            (
+                3i64,
+                "Unrelated note about kubernetes pod scheduling".to_string(),
+            ),
         ];
         let mut edges = Vec::new();
         keyphrase_edges(&chunks, &mut edges);
         // Chunks 1 and 2 share fundraising/investor vocabulary → an edge; 3 is disjoint.
         assert!(
-            edges.iter().any(|(a, b, k, _)| *a == 1 && *b == 2 && *k == "keyphrase"),
+            edges
+                .iter()
+                .any(|(a, b, k, _)| *a == 1 && *b == 2 && *k == "keyphrase"),
             "expected a keyphrase edge between 1 and 2: {edges:?}"
         );
         assert!(

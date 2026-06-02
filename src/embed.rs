@@ -43,9 +43,7 @@ pub fn from_config(cfg: &EmbedderConfig, models_dir: &Path) -> Result<DynEmbedde
             let inner = OpenAIEmbedder::new(&cfg.model, &cfg.api_key_env, cfg.dimensions)?;
             Ok(Arc::new(inner))
         }
-        other => bail!(
-            "unknown embedder provider '{other}'. supported: fastembed, openai"
-        ),
+        other => bail!("unknown embedder provider '{other}'. supported: fastembed, openai"),
     }
 }
 
@@ -134,7 +132,7 @@ impl Embedder for FastembedEmbedder {
             .inner
             .lock()
             .map_err(|e| anyhow!("fastembed mutex poisoned: {e}"))?;
-        Ok(guard.embed(texts.to_vec(), None)?)
+        guard.embed(texts, None)
     }
 }
 
@@ -151,10 +149,10 @@ fn resolve_fastembed_model(name: &str) -> Result<(EmbeddingModel, usize, String)
             if full_match.is_none() || prefer_over(info, full_match.unwrap()) {
                 full_match = Some(info);
             }
-        } else if want == short {
-            if short_match.is_none() || prefer_over(info, short_match.unwrap()) {
-                short_match = Some(info);
-            }
+        } else if want == short
+            && (short_match.is_none() || prefer_over(info, short_match.unwrap()))
+        {
+            short_match = Some(info);
         }
     }
     if let Some(info) = full_match.or(short_match) {
@@ -255,15 +253,11 @@ impl OpenAIEmbedder {
             (None, _) => spec.default_dim,
             (Some(d), Some((mn, mx))) => {
                 if d < mn || d > mx {
-                    bail!(
-                        "openai model '{model}' supports dimensions {mn}..={mx}, got {d}"
-                    );
+                    bail!("openai model '{model}' supports dimensions {mn}..={mx}, got {d}");
                 }
                 d
             }
-            (Some(_), None) => bail!(
-                "openai model '{model}' does not support custom dimensions"
-            ),
+            (Some(_), None) => bail!("openai model '{model}' does not support custom dimensions"),
         };
 
         let api_key = std::env::var(api_key_env).with_context(|| {
@@ -392,9 +386,8 @@ impl OpenAIEmbedder {
             bail!("openai returned status {}: {}", status, body_excerpt);
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            anyhow!("openai embedding failed after {max_attempts} attempts")
-        }))
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("openai embedding failed after {max_attempts} attempts")))
     }
 }
 

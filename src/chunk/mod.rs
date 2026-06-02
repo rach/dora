@@ -79,7 +79,6 @@ pub enum EdgeKind {
     References,
     Implements,
     Imports,
-    Extends,
     /// Authored prose link: Obsidian `[[wikilink]]` or markdown `[text](note.md)`.
     /// Resolved by note title/path (not symbol) and kept distinct from code edges so
     /// PageRank's identifier heuristics never touch it.
@@ -136,5 +135,107 @@ pub fn embedded_text(rel_path_no_ext: &str, heading_path: &str, content: &str) -
         format!("{rel_path_no_ext}\n\n{content}")
     } else {
         format!("{rel_path_no_ext}\n{heading_path}\n\n{content}")
+    }
+}
+
+/// Lightweight aliases for code symbols. These are search-only hints: canonical
+/// `chunks.symbol` stays unchanged for graph resolution and exact lookups.
+pub fn symbol_alias_text(heading_path: &str, symbol: &str) -> String {
+    let mut aliases = Vec::new();
+    push_unique(&mut aliases, symbol.to_string());
+    let words = split_identifier(symbol);
+    if words.len() > 1 {
+        push_unique(&mut aliases, words.join(" "));
+        push_unique(&mut aliases, words.join("_"));
+        push_unique(&mut aliases, words.join("-"));
+    }
+    if !heading_path.is_empty() {
+        push_unique(&mut aliases, format!("{heading_path}::{symbol}"));
+        push_unique(&mut aliases, format!("{heading_path}.{symbol}"));
+        let normalized = heading_path.replace("::", ".").replace('/', ".");
+        push_unique(&mut aliases, format!("{normalized}.{symbol}"));
+    }
+    aliases.join("\n")
+}
+
+pub fn symbol_matches_alias(symbol: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q == symbol {
+        return true;
+    }
+    symbol_alias_text("", symbol)
+        .lines()
+        .any(|alias| alias.eq_ignore_ascii_case(q))
+}
+
+fn push_unique(out: &mut Vec<String>, value: String) {
+    if !value.trim().is_empty() && !out.iter().any(|v| v == &value) {
+        out.push(value);
+    }
+}
+
+fn split_identifier(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev: Option<char> = None;
+    let chars: Vec<char> = input.chars().collect();
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if ch == '_' || ch == '-' || ch == ':' || ch == '.' || ch == '/' {
+            flush_word(&mut current, &mut words);
+            prev = None;
+            continue;
+        }
+        let next = chars.get(idx + 1).copied();
+        let boundary = prev
+            .map(|p| {
+                (p.is_lowercase() && ch.is_uppercase())
+                    || (p.is_alphabetic() && ch.is_numeric())
+                    || (p.is_numeric() && ch.is_alphabetic())
+                    || (p.is_uppercase()
+                        && ch.is_uppercase()
+                        && next.map(|n| n.is_lowercase()).unwrap_or(false))
+            })
+            .unwrap_or(false);
+        if boundary {
+            flush_word(&mut current, &mut words);
+        }
+        current.push(ch.to_ascii_lowercase());
+        prev = Some(ch);
+    }
+    flush_word(&mut current, &mut words);
+    words
+}
+
+fn flush_word(current: &mut String, words: &mut Vec<String>) {
+    if !current.is_empty() {
+        words.push(std::mem::take(current));
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::{split_identifier, symbol_alias_text, symbol_matches_alias};
+
+    #[test]
+    fn aliases_split_common_identifier_shapes() {
+        assert_eq!(
+            split_identifier("processRequest"),
+            vec!["process", "request"]
+        );
+        assert_eq!(
+            split_identifier("MAX_RETRY_COUNT"),
+            vec!["max", "retry", "count"]
+        );
+        assert_eq!(split_identifier("HTTPServer2"), vec!["http", "server", "2"]);
+    }
+
+    #[test]
+    fn aliases_include_qualified_forms() {
+        let aliases = symbol_alias_text("Store", "openConnection");
+        assert!(aliases.lines().any(|a| a == "open connection"));
+        assert!(aliases.lines().any(|a| a == "open_connection"));
+        assert!(aliases.lines().any(|a| a == "Store::openConnection"));
+        assert!(aliases.lines().any(|a| a == "Store.openConnection"));
+        assert!(symbol_matches_alias("openConnection", "open connection"));
     }
 }

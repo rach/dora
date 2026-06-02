@@ -34,6 +34,20 @@ const PRF_ANN_TOP: usize = 10;
 const PRF_MAX_TERMS: usize = 5;
 const PRF_MIN_TERM_LEN: usize = 3;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HitSignals {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ann_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub literal_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prf_rank: Option<usize>,
+    pub graph_boost: f64,
+    pub final_score: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Hit {
     /// Stable id of the chunk in this source's index. Exposed so the MCP layer (or agents
@@ -54,6 +68,10 @@ pub struct Hit {
     /// hits carry "TypeScript SDK reference" — qmd parity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// Optional retrieval diagnostics. Only populated for explicit diagnostic flows
+    /// (`--signals`, `dora explain`, eval internals); normal CLI/MCP searches omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signals: Option<HitSignals>,
 }
 
 /// Knobs threaded through the public `search()` entry point. Callers (CLI, MCP) build
@@ -75,6 +93,8 @@ pub struct SearchOptions<'a> {
     /// Boolean exclusion terms (`--not` / `not`). Chunks scoring highly on any not-query are
     /// dropped; weaker matches get a soft demote. Empty = no exclusion.
     pub not_queries: Vec<String>,
+    /// Populate per-hit retrieval signals for JSON/explain/eval flows.
+    pub diagnostics: bool,
 }
 
 impl<'a> Default for SearchOptions<'a> {
@@ -87,6 +107,7 @@ impl<'a> Default for SearchOptions<'a> {
             output: OutputMode::Chunks,
             and_queries: Vec::new(),
             not_queries: Vec::new(),
+            diagnostics: false,
         }
     }
 }
@@ -101,6 +122,33 @@ pub enum OutputMode {
     Files,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ExplainReport {
+    pub query: String,
+    pub fts_query: String,
+    pub prf_terms: Vec<String>,
+    pub arms: ExplainArms,
+    pub hits: Vec<Hit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExplainArms {
+    pub fts: Vec<ArmHit>,
+    pub ann: Vec<ArmHit>,
+    pub literal: Vec<ArmHit>,
+    pub prf: Vec<ArmHit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArmHit {
+    pub rank: usize,
+    pub chunk_id: i64,
+    pub path: String,
+    pub line: usize,
+    pub heading_path: String,
+    pub snippet: String,
+}
+
 pub fn search(
     query: &str,
     store: &Store,
@@ -109,9 +157,95 @@ pub fn search(
     source_name: &str,
     opts: SearchOptions<'_>,
 ) -> Result<Vec<Hit>> {
+    let (hits, query_vec) = run_search(query, store, embedder, source_root, source_name, opts)?;
+
+    // Best-effort usage logging. The MCP layer's ring buffer + `mark_used_by_query` patches
+    // `used_chunk_id` if a follow-up `multi_get` reads one of the returned paths within 60s.
+    // CLI-only invocations never get attributed, which is fine for v0.6 (data-collection).
+    let chunk_ids: Vec<i64> = hits.iter().map(|h| h.chunk_id).collect();
+    let json = serde_json::to_string(&chunk_ids).unwrap_or_default();
+    if let Err(err) = store.log_usage(query, &query_vec, &json) {
+        eprintln!("dora: usage logging failed (continuing): {err}");
+    }
+
+    Ok(hits)
+}
+
+pub fn explain(
+    query: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    source_root: &Path,
+    source_name: &str,
+    mut opts: SearchOptions<'_>,
+) -> Result<ExplainReport> {
+    opts.diagnostics = true;
+    let detailed = compute_merged_detailed(query, store, embedder, opts.path_prefix)?;
+    let fts_query = detailed.fts_query.clone();
+    let prf_terms = detailed.prf_terms.clone();
+    let arms = ExplainArms {
+        fts: arm_hits(&detailed.fts, store, source_root)?,
+        ann: arm_hits(&detailed.ann, store, source_root)?,
+        literal: arm_hits(&detailed.literal, store, source_root)?,
+        prf: arm_hits(&detailed.prf, store, source_root)?,
+    };
+    let (hits, _query_vec) = run_search_from_detailed(
+        query,
+        store,
+        embedder,
+        source_root,
+        source_name,
+        opts,
+        detailed,
+    )?;
+    Ok(ExplainReport {
+        query: query.to_string(),
+        fts_query,
+        prf_terms,
+        arms,
+        hits,
+    })
+}
+
+fn run_search(
+    query: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    source_root: &Path,
+    source_name: &str,
+    opts: SearchOptions<'_>,
+) -> Result<(Vec<Hit>, Vec<f32>)> {
     // Primary hybrid pass: 4-arm RRF over the user's query. `query_vec` is kept for
     // usage logging downstream.
-    let (mut merged, query_vec) = compute_merged(query, store, embedder, opts.path_prefix)?;
+    let detailed = compute_merged_detailed(query, store, embedder, opts.path_prefix)?;
+    run_search_from_detailed(
+        query,
+        store,
+        embedder,
+        source_root,
+        source_name,
+        opts,
+        detailed,
+    )
+}
+
+fn run_search_from_detailed(
+    _query: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    source_root: &Path,
+    source_name: &str,
+    opts: SearchOptions<'_>,
+    detailed: MergedDetails,
+) -> Result<(Vec<Hit>, Vec<f32>)> {
+    let mut merged = detailed.merged.clone();
+    let query_vec = detailed.query_vec.clone();
+    let rank_signals = if opts.diagnostics {
+        Some(RankSignals::from_details(&detailed))
+    } else {
+        None
+    };
+    let mut graph_boosts = HashMap::new();
 
     // Layer C: Personalized-PageRank graph boost. Seed PPR with the current top hits
     // (weighted by RRF score), spread across the document graph (wikilinks + derived
@@ -125,7 +259,7 @@ pub fn search(
         .map(|v| v != "1")
         .unwrap_or(true);
     if graph_enabled && !merged.is_empty() {
-        apply_graph_boost(store, &mut merged);
+        graph_boosts = apply_graph_boost(store, &mut merged);
     }
 
     // Boolean overlay: --and intersects (harmonic mean of normalized scores), --not
@@ -165,23 +299,14 @@ pub fn search(
         merged.into_iter().take(opts.top_k).collect()
     };
 
-    let mut hits = Vec::with_capacity(merged.len());
-    for (chunk_id, score) in merged.into_iter() {
-        if let Some(chunk) = store.fetch_chunk(chunk_id)? {
-            let line = line_for_byte(source_root, Path::new(&chunk.path), chunk.start_byte);
-            let context = store.context_for(&chunk.path).ok().flatten();
-            hits.push(Hit {
-                chunk_id,
-                source: source_name.to_string(),
-                path: chunk.path,
-                line,
-                score,
-                heading_path: chunk.heading_path,
-                snippet: snippet_from(&chunk.content),
-                context,
-            });
-        }
-    }
+    let mut hits = hits_from_ranked(
+        &merged,
+        store,
+        source_root,
+        source_name,
+        rank_signals.as_ref(),
+        &graph_boosts,
+    )?;
 
     // Files-mode: collapse already deduplicates by file, so we can just strip the
     // chunk-only fields here. (We could also skip the snippet_from work above, but
@@ -194,16 +319,86 @@ pub fn search(
         }
     }
 
-    // Best-effort usage logging. The MCP layer's ring buffer + `mark_used_by_query` patches
-    // `used_chunk_id` if a follow-up `multi_get` reads one of the returned paths within 60s.
-    // CLI-only invocations never get attributed, which is fine for v0.6 (data-collection).
-    let chunk_ids: Vec<i64> = hits.iter().map(|h| h.chunk_id).collect();
-    let json = serde_json::to_string(&chunk_ids).unwrap_or_default();
-    if let Err(err) = store.log_usage(query, &query_vec, &json) {
-        eprintln!("dora: usage logging failed (continuing): {err}");
-    }
+    Ok((hits, query_vec))
+}
 
+struct RankSignals {
+    fts: HashMap<i64, usize>,
+    ann: HashMap<i64, usize>,
+    literal: HashMap<i64, usize>,
+    prf: HashMap<i64, usize>,
+}
+
+impl RankSignals {
+    fn from_details(details: &MergedDetails) -> Self {
+        Self {
+            fts: rank_map(&details.fts),
+            ann: rank_map(&details.ann),
+            literal: rank_map(&details.literal),
+            prf: rank_map(&details.prf),
+        }
+    }
+}
+
+fn rank_map(ids: &[i64]) -> HashMap<i64, usize> {
+    ids.iter()
+        .enumerate()
+        .map(|(idx, id)| (*id, idx + 1))
+        .collect()
+}
+
+fn hits_from_ranked(
+    ranked: &[(i64, f64)],
+    store: &Store,
+    source_root: &Path,
+    source_name: &str,
+    rank_signals: Option<&RankSignals>,
+    graph_boosts: &HashMap<i64, f64>,
+) -> Result<Vec<Hit>> {
+    let mut hits = Vec::with_capacity(ranked.len());
+    for (chunk_id, score) in ranked.iter().copied() {
+        if let Some(chunk) = store.fetch_chunk(chunk_id)? {
+            let line = line_for_byte(source_root, Path::new(&chunk.path), chunk.start_byte);
+            let context = store.context_for(&chunk.path).ok().flatten();
+            let signals = rank_signals.map(|ranks| HitSignals {
+                fts_rank: ranks.fts.get(&chunk_id).copied(),
+                ann_rank: ranks.ann.get(&chunk_id).copied(),
+                literal_rank: ranks.literal.get(&chunk_id).copied(),
+                prf_rank: ranks.prf.get(&chunk_id).copied(),
+                graph_boost: graph_boosts.get(&chunk_id).copied().unwrap_or(0.0),
+                final_score: score,
+            });
+            hits.push(Hit {
+                chunk_id,
+                source: source_name.to_string(),
+                path: chunk.path,
+                line,
+                score,
+                heading_path: chunk.heading_path,
+                snippet: snippet_from(&chunk.content),
+                context,
+                signals,
+            });
+        }
+    }
     Ok(hits)
+}
+
+fn arm_hits(ids: &[i64], store: &Store, source_root: &Path) -> Result<Vec<ArmHit>> {
+    let mut out = Vec::with_capacity(ids.len());
+    for (idx, chunk_id) in ids.iter().copied().enumerate() {
+        if let Some(chunk) = store.fetch_chunk(chunk_id)? {
+            out.push(ArmHit {
+                rank: idx + 1,
+                chunk_id,
+                path: chunk.path.clone(),
+                line: line_for_byte(source_root, Path::new(&chunk.path), chunk.start_byte),
+                heading_path: chunk.heading_path,
+                snippet: snippet_from(&chunk.content),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// One pass of dora's 4-arm hybrid pipeline (FTS + ANN + literal + PRF, fused via RRF).
@@ -214,12 +409,36 @@ pub fn search(
 ///
 /// Used by `search()` for the user's primary query and by `apply_boolean` for each `--and`
 /// / `--not` side query, so all queries share identical ranking semantics.
+type RankedChunks = Vec<(i64, f64)>;
+
+#[derive(Debug, Clone)]
+struct MergedDetails {
+    query_vec: Vec<f32>,
+    fts_query: String,
+    fts: Vec<i64>,
+    ann: Vec<i64>,
+    literal: Vec<i64>,
+    prf_terms: Vec<String>,
+    prf: Vec<i64>,
+    merged: RankedChunks,
+}
+
 fn compute_merged(
     query: &str,
     store: &Store,
     embedder: &dyn Embedder,
     path_prefix: Option<&str>,
-) -> Result<(Vec<(i64, f64)>, Vec<f32>)> {
+) -> Result<(RankedChunks, Vec<f32>)> {
+    let detailed = compute_merged_detailed(query, store, embedder, path_prefix)?;
+    Ok((detailed.merged, detailed.query_vec))
+}
+
+fn compute_merged_detailed(
+    query: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    path_prefix: Option<&str>,
+) -> Result<MergedDetails> {
     let query_vec = embedder.embed_one(query)?;
     let ann = store.search_ann(&query_vec, PER_LIST_LIMIT, path_prefix)?;
 
@@ -271,7 +490,17 @@ fn compute_merged(
             })
     };
 
-    Ok((rrf_merge_n(&[&fts, &ann, &literal, &prf]), query_vec))
+    let merged = rrf_merge_n(&[&fts, &ann, &literal, &prf]);
+    Ok(MergedDetails {
+        query_vec,
+        fts_query,
+        fts,
+        ann,
+        literal,
+        prf_terms,
+        prf,
+        merged,
+    })
 }
 
 /// Personalized-PageRank boost over the document graph. Seeds PPR with the merged top hits
@@ -279,34 +508,33 @@ fn compute_merged(
 /// a bounded boost to each candidate by its normalized PPR mass. Re-ranks the candidate pool
 /// in place. No-op (silent) when the source has no graph. Composes additively with future
 /// boosts (e.g. v0.7 usage signal) since the boost is capped.
-fn apply_graph_boost(store: &Store, merged: &mut Vec<(i64, f64)>) {
+fn apply_graph_boost(store: &Store, merged: &mut [(i64, f64)]) -> HashMap<i64, f64> {
     let edges = match store.graph_edges_for_ppr() {
         Ok(e) if !e.is_empty() => e,
-        _ => return,
+        _ => return HashMap::new(),
     };
     let mut seed: HashMap<i64, f64> = HashMap::new();
     for (id, score) in merged.iter().take(GRAPH_SEED_TOPK) {
         seed.insert(*id, *score);
     }
     if seed.is_empty() {
-        return;
+        return HashMap::new();
     }
-    let ppr = crate::pagerank::compute_ppr(
-        &edges,
-        &seed,
-        GRAPH_PPR_ITERATIONS,
-        GRAPH_PPR_DAMPING,
-    );
+    let ppr = crate::pagerank::compute_ppr(&edges, &seed, GRAPH_PPR_ITERATIONS, GRAPH_PPR_DAMPING);
     let max_ppr = ppr.values().copied().fold(0.0f64, f64::max);
     if max_ppr <= 0.0 {
-        return;
+        return HashMap::new();
     }
+    let mut boosts = HashMap::new();
     for (id, score) in merged.iter_mut() {
         if let Some(mass) = ppr.get(id) {
-            *score += GRAPH_BOOST_CAP * (mass / max_ppr);
+            let boost = GRAPH_BOOST_CAP * (mass / max_ppr);
+            *score += boost;
+            boosts.insert(*id, boost);
         }
     }
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    boosts
 }
 
 /// `--not` thresholds. A candidate with not-score above `NOT_HARD_DROP` is removed entirely
@@ -378,9 +606,7 @@ fn apply_boolean(
         let (mut list, _vec) = compute_merged(nq, store, embedder, path_prefix)?;
         normalize_scores(&mut list);
         let map: HashMap<i64, f64> = list.into_iter().collect();
-        out.retain(|(id, _)| {
-            map.get(id).map(|v| *v <= NOT_HARD_DROP).unwrap_or(true)
-        });
+        out.retain(|(id, _)| map.get(id).map(|v| *v <= NOT_HARD_DROP).unwrap_or(true));
         for (id, score) in out.iter_mut() {
             if let Some(v) = map.get(id) {
                 *score -= NOT_ALPHA * v;
@@ -388,9 +614,7 @@ fn apply_boolean(
         }
     }
 
-    out.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     Ok(out)
 }
 
@@ -470,9 +694,10 @@ fn rrf_merge_n(lists: &[&[i64]]) -> Vec<(i64, f64)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{compute_prf_terms, rrf_merge_n};
-    use crate::store::{ChunkRow, Store, init_sqlite_vec};
+    use crate::store::{init_sqlite_vec, ChunkRow, Store};
     use tempfile::tempdir;
 
     /// PRF must surface vocabulary-adjacent terms from the corpus while filtering out
@@ -593,11 +818,36 @@ mod tests {
         // Without the bonus they'd score 1/61 ≈ 0.0164; with bonus, ≈ 0.0664.
         let one = score_of(1);
         let four = score_of(4);
-        assert!(one > 0.06, "rank-1 ID should get the +0.05 bonus, got {one}");
-        assert!(four > 0.06, "rank-1 ID should get the +0.05 bonus, got {four}");
+        assert!(
+            one > 0.06,
+            "rank-1 ID should get the +0.05 bonus, got {one}"
+        );
+        assert!(
+            four > 0.06,
+            "rank-1 ID should get the +0.05 bonus, got {four}"
+        );
         // ID 2 appears at rank-2 in BOTH lists → 2 × (1/62 + 0.02) ≈ 0.0723. Should be top.
         let two = score_of(2);
         assert!(two > one, "rank-2 in both lists should beat single rank-1");
+    }
+
+    #[test]
+    fn rank_signals_capture_arm_positions() {
+        let details = super::MergedDetails {
+            query_vec: vec![],
+            fts_query: "\"alpha\"".to_string(),
+            fts: vec![10, 20],
+            ann: vec![30, 10],
+            literal: vec![20],
+            prf_terms: vec!["signal".to_string()],
+            prf: vec![40, 10],
+            merged: vec![(10, 1.0), (20, 0.5)],
+        };
+        let signals = super::RankSignals::from_details(&details);
+        assert_eq!(signals.fts.get(&10), Some(&1));
+        assert_eq!(signals.ann.get(&10), Some(&2));
+        assert_eq!(signals.literal.get(&20), Some(&1));
+        assert_eq!(signals.prf.get(&10), Some(&2));
     }
 }
 
@@ -650,7 +900,9 @@ fn snippet_from(content: &str) -> String {
 fn strip_leading_frontmatter(content: &str) -> &str {
     let trimmed = content.trim_start_matches('\u{feff}'); // tolerate stray BOM
     let mut lines = trimmed.lines();
-    let Some(first) = lines.next() else { return content; };
+    let Some(first) = lines.next() else {
+        return content;
+    };
     if first.trim() != "---" {
         return content;
     }
@@ -692,10 +944,7 @@ fn compute_prf_terms(store: &Store, ann_ids: &[i64], query: &str, max: usize) ->
     let query_words: HashSet<String> = query
         .to_lowercase()
         .split_whitespace()
-        .map(|s| {
-            s.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_string()
-        })
+        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|s| !s.is_empty())
         .collect();
     let mut freq: HashMap<String, usize> = HashMap::new();
@@ -729,26 +978,220 @@ fn compute_prf_terms(store: &Store, ann_ids: &[i64], query: &str, max: usize) ->
 /// is overwhelmingly English in practice; if non-English corpora become a thing we'll add
 /// per-language lists keyed off the source's configured language.
 pub(crate) const STOPWORDS: &[&str] = &[
-    "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and",
-    "any", "are", "aren", "as", "at", "back", "be", "because", "been", "before", "being",
-    "below", "between", "both", "but", "by", "can", "come", "could", "couldn", "day",
-    "did", "didn", "do", "does", "doesn", "doing", "don", "down", "during", "each",
-    "either", "end", "even", "every", "few", "first", "for", "from", "further", "get",
-    "give", "go", "going", "good", "got", "had", "hadn", "has", "hasn", "have", "haven",
-    "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how",
-    "however", "i", "if", "in", "into", "is", "isn", "it", "its", "itself", "just",
-    "know", "last", "left", "let", "like", "look", "made", "make", "making", "many",
-    "may", "me", "might", "more", "most", "mustn", "my", "myself", "need", "needs",
-    "new", "no", "nor", "not", "now", "of", "off", "on", "once", "one", "only", "or",
-    "other", "others", "our", "ours", "ourselves", "out", "over", "own", "part",
-    "people", "put", "rather", "really", "right", "said", "same", "say", "see", "seen",
-    "set", "shall", "shan", "she", "should", "shouldn", "show", "since", "so", "some",
-    "still", "such", "take", "taken", "than", "that", "the", "their", "theirs", "them",
-    "themselves", "then", "there", "these", "they", "thing", "things", "this", "those",
-    "though", "through", "thus", "time", "to", "too", "two", "under", "until", "up",
-    "upon", "us", "use", "used", "uses", "using", "very", "via", "want", "wants", "was",
-    "wasn", "way", "ways", "we", "well", "were", "weren", "what", "when", "where",
-    "whether", "which", "while", "who", "whom", "whose", "why", "will", "with", "within",
-    "without", "won", "would", "wouldn", "yes", "yet", "you", "your", "yours", "yourself",
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "also",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "aren",
+    "as",
+    "at",
+    "back",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "come",
+    "could",
+    "couldn",
+    "day",
+    "did",
+    "didn",
+    "do",
+    "does",
+    "doesn",
+    "doing",
+    "don",
+    "down",
+    "during",
+    "each",
+    "either",
+    "end",
+    "even",
+    "every",
+    "few",
+    "first",
+    "for",
+    "from",
+    "further",
+    "get",
+    "give",
+    "go",
+    "going",
+    "good",
+    "got",
+    "had",
+    "hadn",
+    "has",
+    "hasn",
+    "have",
+    "haven",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "however",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "isn",
+    "it",
+    "its",
+    "itself",
+    "just",
+    "know",
+    "last",
+    "left",
+    "let",
+    "like",
+    "look",
+    "made",
+    "make",
+    "making",
+    "many",
+    "may",
+    "me",
+    "might",
+    "more",
+    "most",
+    "mustn",
+    "my",
+    "myself",
+    "need",
+    "needs",
+    "new",
+    "no",
+    "nor",
+    "not",
+    "now",
+    "of",
+    "off",
+    "on",
+    "once",
+    "one",
+    "only",
+    "or",
+    "other",
+    "others",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "part",
+    "people",
+    "put",
+    "rather",
+    "really",
+    "right",
+    "said",
+    "same",
+    "say",
+    "see",
+    "seen",
+    "set",
+    "shall",
+    "shan",
+    "she",
+    "should",
+    "shouldn",
+    "show",
+    "since",
+    "so",
+    "some",
+    "still",
+    "such",
+    "take",
+    "taken",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "thing",
+    "things",
+    "this",
+    "those",
+    "though",
+    "through",
+    "thus",
+    "time",
+    "to",
+    "too",
+    "two",
+    "under",
+    "until",
+    "up",
+    "upon",
+    "us",
+    "use",
+    "used",
+    "uses",
+    "using",
+    "very",
+    "via",
+    "want",
+    "wants",
+    "was",
+    "wasn",
+    "way",
+    "ways",
+    "we",
+    "well",
+    "were",
+    "weren",
+    "what",
+    "when",
+    "where",
+    "whether",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "will",
+    "with",
+    "within",
+    "without",
+    "won",
+    "would",
+    "wouldn",
+    "yes",
+    "yet",
+    "you",
+    "your",
+    "yours",
+    "yourself",
     "yourselves",
 ];

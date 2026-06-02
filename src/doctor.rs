@@ -239,7 +239,10 @@ fn check_registry() -> Vec<Check> {
             out.push(Check {
                 status: CheckStatus::Err,
                 label,
-                detail: format!("no .dora/index.db at {} — run `dora index`", src.path.display()),
+                detail: format!(
+                    "no .dora/index.db at {} — run `dora index`",
+                    src.path.display()
+                ),
             });
             continue;
         }
@@ -377,7 +380,9 @@ fn chunk_kind_breakdown(store: &Store) -> Result<Vec<(String, i64)>> {
     let mut stmt = store
         .conn()
         .prepare("SELECT kind, COUNT(*) FROM chunks GROUP BY kind ORDER BY COUNT(*) DESC")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -388,22 +393,15 @@ fn chunk_kind_breakdown(store: &Store) -> Result<Vec<(String, i64)>> {
 // ---------- MCP host configs ----------
 
 fn check_mcp_hosts(home: &Path) -> Vec<Check> {
-    let mut out = Vec::new();
-    out.push(check_json_host(
-        "Claude Code",
-        &home.join(".claude.json"),
-        "mcpServers",
-    ));
-    out.push(check_json_host(
-        "Cursor",
-        &home.join(".cursor").join("mcp.json"),
-        "mcpServers",
-    ));
-    out.push(check_toml_host(
-        "Codex",
-        &home.join(".codex").join("config.toml"),
-    ));
-    out
+    vec![
+        check_json_host("Claude Code", &home.join(".claude.json"), "mcpServers"),
+        check_json_host(
+            "Cursor",
+            &home.join(".cursor").join("mcp.json"),
+            "mcpServers",
+        ),
+        check_toml_host("Codex", &home.join(".codex").join("config.toml")),
+    ]
 }
 
 fn check_json_host(name: &str, path: &Path, key: &str) -> Check {
@@ -428,7 +426,11 @@ fn check_json_host(name: &str, path: &Path, key: &str) -> Check {
         return Check {
             status: CheckStatus::Warn,
             label: name.into(),
-            detail: format!("{} empty — run `dora install --client {}`", path.display(), name.to_lowercase()),
+            detail: format!(
+                "{} empty — run `dora install --client {}`",
+                path.display(),
+                name.to_lowercase()
+            ),
         };
     }
     let root: serde_json::Value = match serde_json::from_str(&text) {
@@ -441,10 +443,7 @@ fn check_json_host(name: &str, path: &Path, key: &str) -> Check {
             }
         }
     };
-    let has_dora = root
-        .get(key)
-        .and_then(|v| v.get("dora"))
-        .is_some();
+    let has_dora = root.get(key).and_then(|v| v.get("dora")).is_some();
     if has_dora {
         Check {
             status: CheckStatus::Ok,
@@ -458,7 +457,10 @@ fn check_json_host(name: &str, path: &Path, key: &str) -> Check {
             detail: format!(
                 "{} present but no `dora` entry — run `dora install --client {}`",
                 path.display(),
-                name.to_lowercase().split_whitespace().next().unwrap_or("claude")
+                name.to_lowercase()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("claude")
             ),
         }
     }
@@ -552,11 +554,7 @@ fn check_shell_wrapper(home: &Path) -> Vec<Check> {
         out.push(Check {
             status: CheckStatus::Ok,
             label: "~/.zshrc".into(),
-            detail: format!(
-                "dora wrappers: {} — {}",
-                installed.join(", "),
-                toggle_state
-            ),
+            detail: format!("dora wrappers: {} — {}", installed.join(", "), toggle_state),
         });
     }
     out
@@ -655,7 +653,11 @@ fn render_section(title: &str, checks: &[Check]) -> String {
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn now_secs() -> u64 {

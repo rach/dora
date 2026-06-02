@@ -2,6 +2,8 @@ mod chunk;
 mod config;
 mod doctor;
 mod embed;
+#[cfg(debug_assertions)]
+mod eval;
 mod graph;
 mod install;
 mod mcp;
@@ -35,7 +37,7 @@ const WALK_DEBOUNCE_SECS: u64 = 2;
 #[derive(Parser)]
 #[command(
     name = "dora",
-    about = "Personal memory: semantic search over a markdown vault.",
+    about = "Local semantic memory for notes, code, and agent transcripts.",
     version
 )]
 struct Cli {
@@ -48,6 +50,10 @@ struct Cli {
     /// Output JSON instead of ripgrep-style.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Include retrieval signals in JSON output. Normal pretty output ignores this.
+    #[arg(long, global = true)]
+    signals: bool,
 
     /// Override the configured top_k for this call.
     #[arg(long, global = true)]
@@ -104,7 +110,12 @@ enum Command {
 
         /// Serve only these registered sources (comma-separated or repeated).
         /// Mutually exclusive with --exclude and --source.
-        #[arg(long, value_name = "NAME", value_delimiter = ',', conflicts_with = "exclude")]
+        #[arg(
+            long,
+            value_name = "NAME",
+            value_delimiter = ',',
+            conflicts_with = "exclude"
+        )]
         include: Vec<String>,
 
         /// Serve every registered source EXCEPT these.
@@ -176,7 +187,12 @@ enum Command {
     /// Foreground file-watcher that keeps registered sources fresh. Runs until Ctrl-C.
     /// Same `--include` / `--exclude` semantics as `dora mcp`.
     Watch {
-        #[arg(long, value_name = "NAME", value_delimiter = ',', conflicts_with = "exclude")]
+        #[arg(
+            long,
+            value_name = "NAME",
+            value_delimiter = ',',
+            conflicts_with = "exclude"
+        )]
         include: Vec<String>,
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
         exclude: Vec<String>,
@@ -203,6 +219,20 @@ enum Command {
     Graph {
         #[command(subcommand)]
         action: GraphAction,
+    },
+    /// Explain how dora ranked a query in the current source.
+    Explain {
+        /// Query to diagnose.
+        query: String,
+    },
+    /// Run a committed retrieval eval fixture. Dev/debug builds only; absent from release.
+    #[cfg(debug_assertions)]
+    Eval {
+        /// Fixture directory containing docs/ and queries.toml.
+        fixture: PathBuf,
+        /// Optional minimum R@1 threshold. Exits nonzero if missed.
+        #[arg(long, value_name = "FLOAT")]
+        min_r_at_1: Option<f64>,
     },
 }
 
@@ -282,9 +312,7 @@ enum SourceAction {
         mode: Option<String>,
     },
     /// Remove a source from the registry by name. Doesn't touch the source's `.dora/` dir.
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
     /// List all registered sources.
     List,
     /// Set or clear the description for an existing source.
@@ -313,11 +341,24 @@ fn main() -> Result<()> {
             port,
             daemon,
             action,
-        }) => cmd_mcp(source, include, exclude, http, bind, port, daemon, action),
+        }) => cmd_mcp(McpOptions {
+            source,
+            include,
+            exclude,
+            http,
+            bind,
+            port,
+            daemon,
+            action,
+        }),
         Some(Command::Source { action }) => cmd_source(action),
-        Some(Command::Install { client, include, exclude, no_shell, wrap }) => {
-            cmd_install(client, include, exclude, !no_shell, wrap)
-        }
+        Some(Command::Install {
+            client,
+            include,
+            exclude,
+            no_shell,
+            wrap,
+        }) => cmd_install(client, include, exclude, !no_shell, wrap),
         Some(Command::Doctor) => cmd_doctor(),
         Some(Command::Watch { include, exclude }) => cmd_watch(include, exclude),
         Some(Command::Wrappers { action }) => cmd_wrappers(action),
@@ -330,21 +371,40 @@ fn main() -> Result<()> {
             let cwd = std::env::current_dir()?;
             cmd_graph(&cwd, action)
         }
+        Some(Command::Explain { query }) => {
+            let cwd = std::env::current_dir()?;
+            cmd_explain(&cwd, &query, cli.top_k, cli.json)
+        }
+        #[cfg(debug_assertions)]
+        Some(Command::Eval {
+            fixture,
+            min_r_at_1,
+        }) => eval::cmd_eval(&fixture, min_r_at_1),
         None => {
             let q = cli
                 .query
                 .context("provide a query, or use `dora index <path>` first")?;
             let cwd = std::env::current_dir()?;
             cmd_search(
-                &cwd, &q, cli.top_k, cli.json, cli.min_score, cli.all, cli.files,
-                cli.and, cli.not,
+                &cwd,
+                &q,
+                CliSearchOptions {
+                    top_k_override: cli.top_k,
+                    json: cli.json,
+                    signals: cli.signals,
+                    min_score: cli.min_score,
+                    all: cli.all,
+                    files: cli.files,
+                    and_queries: cli.and,
+                    not_queries: cli.not,
+                },
             )
         }
     }
 }
 
-fn cmd_mcp(
-    source_arg: Option<PathBuf>,
+struct McpOptions {
+    source: Option<PathBuf>,
     include: Vec<String>,
     exclude: Vec<String>,
     http: bool,
@@ -352,19 +412,21 @@ fn cmd_mcp(
     port: u16,
     daemon: bool,
     action: Option<McpAction>,
-) -> Result<()> {
+}
+
+fn cmd_mcp(opts: McpOptions) -> Result<()> {
     // Subcommand actions short-circuit: stop/status don't need to spin up a server.
-    if let Some(action) = action {
+    if let Some(action) = opts.action {
         return match action {
-            McpAction::Stop => mcp_stop(&bind, port),
-            McpAction::Status => mcp_status(&bind, port),
+            McpAction::Stop => mcp_stop(&opts.bind, opts.port),
+            McpAction::Status => mcp_status(&opts.bind, opts.port),
         };
     }
 
     // Optional fork-into-background. After this returns in the child, we continue normally;
     // the parent has already exited.
-    if daemon {
-        if !http {
+    if opts.daemon {
+        if !opts.http {
             bail!("--daemon requires --http (stdio doesn't make sense as a background server)");
         }
         let pid_path = mcp_http_pid_path()?;
@@ -395,7 +457,7 @@ fn cmd_mcp(
         // Child continues below.
     }
 
-    let rt = if http {
+    let rt = if opts.http {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -407,10 +469,10 @@ fn cmd_mcp(
             .context("build tokio runtime for mcp stdio")?
     };
 
-    let transport = if http {
-        let addr: std::net::SocketAddr = format!("{bind}:{port}")
+    let transport = if opts.http {
+        let addr: std::net::SocketAddr = format!("{}:{}", opts.bind, opts.port)
             .parse()
-            .with_context(|| format!("invalid --bind/--port combo: {bind}:{port}"))?;
+            .with_context(|| format!("invalid --bind/--port combo: {}:{}", opts.bind, opts.port))?;
         if !addr.ip().is_loopback() {
             eprintln!(
                 "dora mcp: WARNING — exposing HTTP beyond loopback ({addr}). Indexed content \
@@ -422,18 +484,20 @@ fn cmd_mcp(
         mcp::Transport::Stdio
     };
 
-    match source_arg {
-        Some(path) if !http => rt.block_on(mcp::run(&path)),
-        Some(_) => bail!("--source is incompatible with --http; HTTP daemon serves the full registry"),
+    match opts.source {
+        Some(path) if !opts.http => rt.block_on(mcp::run(&path)),
+        Some(_) => {
+            bail!("--source is incompatible with --http; HTTP daemon serves the full registry")
+        }
         None => {
             let mut reg = registry::Registry::load().context("load registry")?;
-            if reg.sources.is_empty() && !http {
+            if reg.sources.is_empty() && !opts.http {
                 bail!(
                     "no sources registered. Add one with `dora source add <path>`, or run \
                      `dora mcp --source <path>` for a one-off."
                 );
             }
-            filter_registry(&mut reg, &include, &exclude)?;
+            filter_registry(&mut reg, &opts.include, &opts.exclude)?;
             rt.block_on(mcp::run_multi(reg, transport))
         }
     }
@@ -638,7 +702,11 @@ fn cmd_context(action: ContextAction) -> Result<()> {
     }
 
     match action {
-        ContextAction::Add { source, prefix, text } => {
+        ContextAction::Add {
+            source,
+            prefix,
+            text,
+        } => {
             let store = open_store_for_source(&source)?;
             store.add_context(&prefix, &text)?;
             println!("context: {source} {prefix} → {text}");
@@ -693,7 +761,12 @@ fn cmd_doctor() -> Result<()> {
 
 fn cmd_source(action: SourceAction) -> Result<()> {
     match action {
-        SourceAction::Add { path, name, description, mode } => {
+        SourceAction::Add {
+            path,
+            name,
+            description,
+            mode,
+        } => {
             let abs = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize {}", path.display()))?;
@@ -756,7 +829,9 @@ fn cmd_source(action: SourceAction) -> Result<()> {
             // Surface a one-line nudge about watch — uses kill -0 liveness so a stale
             // PID file from a crashed watcher doesn't give the wrong hint.
             if crate::watch::is_running() {
-                eprintln!("hint: dora watch is running — it'll pick up '{final_name}' automatically.");
+                eprintln!(
+                    "hint: dora watch is running — it'll pick up '{final_name}' automatically."
+                );
             } else {
                 eprintln!(
                     "hint: run `dora watch` in the background to keep '{final_name}' indexed live."
@@ -777,7 +852,13 @@ fn cmd_source(action: SourceAction) -> Result<()> {
                 println!("(no sources registered — `dora source add <path>`)");
                 return Ok(());
             }
-            let name_w = reg.sources.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
+            let name_w = reg
+                .sources
+                .iter()
+                .map(|s| s.name.len())
+                .max()
+                .unwrap_or(4)
+                .max(4);
             println!("{:<width$}  STATUS  PATH", "NAME", width = name_w);
             for s in &reg.sources {
                 let indexed = s.path.join(".dora").join("index.db").exists();
@@ -813,13 +894,13 @@ fn cmd_source(action: SourceAction) -> Result<()> {
     }
 }
 
-fn dora_dir(vault: &Path) -> PathBuf {
+pub(crate) fn dora_dir(vault: &Path) -> PathBuf {
     vault.join(".dora")
 }
-fn db_path(vault: &Path) -> PathBuf {
+pub(crate) fn db_path(vault: &Path) -> PathBuf {
     dora_dir(vault).join("index.db")
 }
-fn models_dir(vault: &Path) -> PathBuf {
+pub(crate) fn models_dir(vault: &Path) -> PathBuf {
     dora_dir(vault).join("models")
 }
 
@@ -851,7 +932,14 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
     let mut store = Store::open(&db, embedder.dims())?;
     write_identity_meta(&store, embedder.as_ref())?;
 
-    let summary = run_incremental_index(&vault, &cfg, &chunker, embedder.as_ref(), &mut store, dry_run)?;
+    let summary = run_incremental_index(
+        &vault,
+        &cfg,
+        &chunker,
+        embedder.as_ref(),
+        &mut store,
+        dry_run,
+    )?;
 
     let settling_note = if summary.settling > 0 {
         format!(", {} settling", summary.settling)
@@ -876,17 +964,18 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
 
 // ---------------- search ----------------
 
-fn cmd_search(
-    cwd: &Path,
-    query: &str,
+struct CliSearchOptions {
     top_k_override: Option<usize>,
     json: bool,
+    signals: bool,
     min_score: Option<f64>,
     all: bool,
     files: bool,
     and_queries: Vec<String>,
     not_queries: Vec<String>,
-) -> Result<()> {
+}
+
+fn cmd_search(cwd: &Path, query: &str, cli_opts: CliSearchOptions) -> Result<()> {
     let source_root = cwd.canonicalize()?;
     let db = db_path(&source_root);
     if !db.exists() {
@@ -910,32 +999,35 @@ fn cmd_search(
             .unwrap_or_else(|| "source".to_string())
     });
 
-    let top_k = top_k_override.unwrap_or(cfg.search.top_k);
+    let top_k = cli_opts.top_k_override.unwrap_or(cfg.search.top_k);
     let opts = search::SearchOptions {
         top_k,
-        min_score,
-        all,
+        min_score: cli_opts.min_score,
+        all: cli_opts.all,
         path_prefix: None,
-        output: if files {
+        output: if cli_opts.files {
             search::OutputMode::Files
         } else {
             search::OutputMode::Chunks
         },
-        and_queries,
-        not_queries,
+        and_queries: cli_opts.and_queries,
+        not_queries: cli_opts.not_queries,
+        diagnostics: cli_opts.signals,
     };
     let hits = search_with_self_heal(
-        &source_root,
-        &source_name,
-        &cfg,
-        &mut store,
-        &chunker,
-        embedder.as_ref(),
+        SearchRuntime {
+            source_root: &source_root,
+            source_name: &source_name,
+            cfg: &cfg,
+            store: &mut store,
+            chunker: &chunker,
+            embedder: embedder.as_ref(),
+        },
         query,
         opts,
     )?;
 
-    if json {
+    if cli_opts.json {
         println!("{}", serde_json::to_string_pretty(&hits)?);
         return Ok(());
     }
@@ -943,7 +1035,7 @@ fn cmd_search(
         eprintln!("no hits");
         return Ok(());
     }
-    if files {
+    if cli_opts.files {
         // Files mode: one path per line, no decoration. Pairs cleanly with shell pipes.
         for h in hits {
             println!("{}", h.path);
@@ -960,8 +1052,105 @@ fn cmd_search(
     Ok(())
 }
 
+fn cmd_explain(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool) -> Result<()> {
+    let source_root = cwd.canonicalize()?;
+    let db = db_path(&source_root);
+    if !db.exists() {
+        bail!(
+            ".dora/index.db not found in {}. Run `dora index` first.",
+            source_root.display()
+        );
+    }
+
+    let cfg = Config::load_or_default(&source_root).context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+    let mut store = Store::open(&db, embedder.dims())?;
+    check_meta(&store, embedder.as_ref())?;
+    let chunker: BoxedChunker = chunk::from_config(&cfg, &source_root);
+    let source_name = registry::find_source_name_for_path(&source_root).unwrap_or_else(|| {
+        source_root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "source".to_string())
+    });
+
+    if now_secs().saturating_sub(
+        store
+            .get_meta("last_walk_at")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    ) >= WALK_DEBOUNCE_SECS
+    {
+        run_incremental_index(
+            &source_root,
+            &cfg,
+            &chunker,
+            embedder.as_ref(),
+            &mut store,
+            false,
+        )?;
+    }
+
+    let report = search::explain(
+        query,
+        &store,
+        embedder.as_ref(),
+        &source_root,
+        &source_name,
+        search::SearchOptions {
+            top_k: top_k_override.unwrap_or(cfg.search.top_k),
+            diagnostics: true,
+            ..Default::default()
+        },
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("query: {}", report.query);
+    println!("fts: {}", report.fts_query);
+    if report.prf_terms.is_empty() {
+        println!("prf: (none)");
+    } else {
+        println!("prf: {}", report.prf_terms.join(", "));
+    }
+    render_arm_summary("fts", &report.arms.fts);
+    render_arm_summary("ann", &report.arms.ann);
+    render_arm_summary("literal", &report.arms.literal);
+    render_arm_summary("prf", &report.arms.prf);
+    println!("\nfinal:");
+    for h in &report.hits {
+        let signals = h.signals.as_ref();
+        println!(
+            "  {:>7.4} {}:{} {}",
+            h.score, h.path, h.line, h.heading_path
+        );
+        if let Some(s) = signals {
+            println!(
+                "          fts={:?} ann={:?} literal={:?} prf={:?} graph=+{:.4}",
+                s.fts_rank, s.ann_rank, s.literal_rank, s.prf_rank, s.graph_boost
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_arm_summary(name: &str, hits: &[search::ArmHit]) {
+    println!("\n{name}:");
+    if hits.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for h in hits.iter().take(5) {
+        println!("  #{:<2} {}:{} {}", h.rank, h.path, h.line, h.snippet);
+    }
+}
+
 /// Minimalist `rg`-inspired text rendering: one header line per hit (path:line + heading
 /// + score badge), then up to ~4 preview lines from the chunk indented under a thin bar.
+///
 /// Falls back to plain text + no decorations when stdout isn't a TTY (so pipes into jq,
 /// grep, awk continue to see machine-parseable output).
 fn render_hit_rich(store: &Store, h: &search::Hit, style: &AnsiStyle) {
@@ -1044,7 +1233,9 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 fn strip_leading_frontmatter_str(content: &str) -> &str {
     let trimmed = content.trim_start_matches('\u{feff}');
     let mut lines = trimmed.lines();
-    let Some(first) = lines.next() else { return content; };
+    let Some(first) = lines.next() else {
+        return content;
+    };
     if first.trim() != "---" {
         return content;
     }
@@ -1074,14 +1265,13 @@ struct AnsiStyle {
 impl AnsiStyle {
     fn detect() -> Self {
         use std::io::IsTerminal;
-        let use_color =
-            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+        let use_color = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
         if use_color {
             Self {
-                path: "\x1b[1;35m",      // bold magenta
-                line_num: "\x1b[32m",     // green
-                heading: "\x1b[36m",      // cyan
-                score: "\x1b[2;33m",      // dim yellow
+                path: "\x1b[1;35m",   // bold magenta
+                line_num: "\x1b[32m", // green
+                heading: "\x1b[36m",  // cyan
+                score: "\x1b[2;33m",  // dim yellow
                 dim: "\x1b[2m",
                 italic_dim: "\x1b[2;3m",
                 reset: "\x1b[0m",
@@ -1168,24 +1358,43 @@ fn cmd_graph(cwd: &Path, action: GraphAction) -> Result<()> {
 /// Fire a self-healing incremental walk if `last_walk_at` is stale (older than
 /// `WALK_DEBOUNCE_SECS`), then run the hybrid search. Called from both `cmd_search` (CLI)
 /// and the MCP `search` tool handler — single source of truth for the freshness story.
+pub(crate) struct SearchRuntime<'a> {
+    pub source_root: &'a Path,
+    pub source_name: &'a str,
+    pub cfg: &'a Config,
+    pub store: &'a mut Store,
+    pub chunker: &'a dyn Chunker,
+    pub embedder: &'a dyn Embedder,
+}
+
 pub(crate) fn search_with_self_heal(
-    source_root: &Path,
-    source_name: &str,
-    cfg: &Config,
-    store: &mut Store,
-    chunker: &dyn Chunker,
-    embedder: &dyn Embedder,
+    rt: SearchRuntime<'_>,
     query: &str,
     opts: search::SearchOptions<'_>,
 ) -> Result<Vec<search::Hit>> {
-    let last_walk: u64 = store
+    let last_walk: u64 = rt
+        .store
         .get_meta("last_walk_at")?
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if now_secs().saturating_sub(last_walk) >= WALK_DEBOUNCE_SECS {
-        run_incremental_index(source_root, cfg, chunker, embedder, store, false)?;
+        run_incremental_index(
+            rt.source_root,
+            rt.cfg,
+            rt.chunker,
+            rt.embedder,
+            rt.store,
+            false,
+        )?;
     }
-    search::search(query, store, embedder, source_root, source_name, opts)
+    search::search(
+        query,
+        rt.store,
+        rt.embedder,
+        rt.source_root,
+        rt.source_name,
+        opts,
+    )
 }
 
 // ---------------- incremental indexing core ----------------
@@ -1221,7 +1430,7 @@ struct EmbedWork {
     inputs: Vec<String>, // path/heading-prepended text fed to the embedder
 }
 
-fn run_incremental_index(
+pub(crate) fn run_incremental_index(
     vault: &Path,
     cfg: &Config,
     chunker: &dyn Chunker,
@@ -1257,8 +1466,10 @@ fn run_incremental_index(
     let mut to_insert: Vec<(String, String, u64, u64, String)> = Vec::new(); // (path, content, mtime, size, hash)
     let mut to_update: Vec<(String, String, u64, u64, String)> = Vec::new();
     let mut to_touch: Vec<(String, u64)> = Vec::new();
-    let mut summary = DiffSummary::default();
-    summary.settling = summary_settling;
+    let mut summary = DiffSummary {
+        settling: summary_settling,
+        ..Default::default()
+    };
 
     for entry in &entries {
         let rel = entry.relative_path.to_string_lossy().to_string();
@@ -1336,7 +1547,17 @@ fn run_incremental_index(
         let edges = chunker.edges(content, path, &chunks);
         let inputs: Vec<String> = chunks
             .iter()
-            .map(|c| chunk::embedded_text(&rel_no_ext, &c.heading_path, &c.content))
+            .map(|c| {
+                let mut text = chunk::embedded_text(&rel_no_ext, &c.heading_path, &c.content);
+                if let Some(symbol) = c.symbol.as_deref() {
+                    let aliases = chunk::symbol_alias_text(&c.heading_path, symbol);
+                    if !aliases.is_empty() {
+                        text.push_str("\n\naliases:\n");
+                        text.push_str(&aliases);
+                    }
+                }
+                text
+            })
             .collect();
         work.push(EmbedWork {
             kind,
@@ -1350,10 +1571,26 @@ fn run_incremental_index(
         });
     };
     for (path, content, mtime, size, hash) in &still_inserts {
-        push_work(&mut work, WorkKind::Insert, path, content, *mtime, *size, hash);
+        push_work(
+            &mut work,
+            WorkKind::Insert,
+            path,
+            content,
+            *mtime,
+            *size,
+            hash,
+        );
     }
     for (path, content, mtime, size, hash) in &to_update {
-        push_work(&mut work, WorkKind::Update, path, content, *mtime, *size, hash);
+        push_work(
+            &mut work,
+            WorkKind::Update,
+            path,
+            content,
+            *mtime,
+            *size,
+            hash,
+        );
     }
 
     // Cost preview (paid providers only): chunks that will actually be embedded.
@@ -1375,7 +1612,10 @@ fn run_incremental_index(
                 est_cost,
             );
         } else {
-            eprintln!("{} provider, 0 chunks to embed (nothing changed)", embedder.id());
+            eprintln!(
+                "{} provider, 0 chunks to embed (nothing changed)",
+                embedder.id()
+            );
         }
     }
 
@@ -1506,7 +1746,6 @@ fn edge_kind_str(k: chunk::EdgeKind) -> &'static str {
         References => "references",
         Implements => "implements",
         Imports => "imports",
-        Extends => "extends",
         Wikilink => "wikilink",
     }
 }
@@ -1517,7 +1756,7 @@ fn edge_kind_str(k: chunk::EdgeKind) -> &'static str {
 /// Opens the connection without running `create_schema` so a stale DB with the previous schema
 /// can be detected (and then wiped) without first tripping on a CREATE INDEX referencing a
 /// column the old schema doesn't have.
-fn meta_matches(db_path: &Path, embedder: &dyn Embedder) -> Result<bool> {
+pub(crate) fn meta_matches(db_path: &Path, embedder: &dyn Embedder) -> Result<bool> {
     let conn = rusqlite::Connection::open(db_path).context("open sqlite db (meta check)")?;
     let want = [
         ("schema_version", SCHEMA_VERSION.to_string()),
@@ -1539,7 +1778,7 @@ fn meta_matches(db_path: &Path, embedder: &dyn Embedder) -> Result<bool> {
     Ok(true)
 }
 
-fn write_identity_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
+pub(crate) fn write_identity_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
     store.set_meta("schema_version", SCHEMA_VERSION)?;
     store.set_meta("chunker_version", CHUNKER_VERSION)?;
     store.set_meta("embedder_id", embedder.id())?;
@@ -1549,7 +1788,7 @@ fn write_identity_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
 
 /// Refuse to search if the on-disk DB was built with different config/version than the current
 /// binary or config.
-fn check_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
+pub(crate) fn check_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
     let expected = [
         ("schema_version", SCHEMA_VERSION.to_string()),
         ("chunker_version", CHUNKER_VERSION.to_string()),
@@ -1623,7 +1862,6 @@ fn write_source_mode(root: &Path, mode: &str) -> Result<()> {
     if in_source_section && !wrote_mode {
         out.push_str(&new_assignment);
         out.push('\n');
-        wrote_mode = true;
     }
     if !has_source_section {
         if !out.is_empty() && !out.ends_with("\n\n") {

@@ -15,7 +15,7 @@ use std::path::Path;
 use crate::mode::Mode;
 
 pub const SCHEMA_VERSION: &str = "3";
-pub const CHUNKER_VERSION: &str = "3";
+pub const CHUNKER_VERSION: &str = "4";
 
 // ---------- final, resolved types (what the rest of the codebase reads) ----------
 
@@ -33,15 +33,9 @@ pub struct Config {
 
 /// `[graph]` settings (Layer B derived edges). `entities` opts into the GLiNER entity-edge
 /// extractor (~300 MB ONNX); off by default — keyphrase + similarity edges are always built.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GraphConfig {
     pub entities: bool,
-}
-
-impl Default for GraphConfig {
-    fn default() -> Self {
-        Self { entities: false }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,19 +266,13 @@ impl Config {
                         .claude_code
                         .include_thinking
                         .unwrap_or(d.include_thinking),
-                    settle_seconds: raw
-                        .claude_code
-                        .settle_seconds
-                        .unwrap_or(d.settle_seconds),
+                    settle_seconds: raw.claude_code.settle_seconds.unwrap_or(d.settle_seconds),
                 }
             },
             codex: {
                 let d = CodexConfig::default();
                 CodexConfig {
-                    include_reasoning: raw
-                        .codex
-                        .include_reasoning
-                        .unwrap_or(d.include_reasoning),
+                    include_reasoning: raw.codex.include_reasoning.unwrap_or(d.include_reasoning),
                     settle_seconds: raw.codex.settle_seconds.unwrap_or(d.settle_seconds),
                 }
             },

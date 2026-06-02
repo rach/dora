@@ -1,0 +1,15 @@
+[[query]]
+name = "hook-first-sentence"
+query = "why does the opening sentence matter"
+relevant = ["writing/hooks.md"]
+
+[[query]]
+name = "local-search"
+query = "local semantic search without cloud"
+relevant = ["engineering/local-search.md"]
+
+[[query]]
+name = "call-graph"
+query = "where do symbol callers and definitions help agents"
+relevant = ["engineering/code-navigation.md"]
+

@@ -56,7 +56,13 @@ impl Chunker for MarkdownChunker {
         }
 
         if text.len() <= self.atomic_below_bytes {
-            return vec![prose_chunk(0, String::new(), text.to_string(), 0, text.len())];
+            return vec![prose_chunk(
+                0,
+                String::new(),
+                text.to_string(),
+                0,
+                text.len(),
+            )];
         }
 
         let sections = split_by_headings(text);
@@ -489,12 +495,18 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
         return (None, text);
     }
     let (ls0, le0) = spans[0];
-    let first = text[ls0..le0].trim_end_matches('\n').trim_end_matches('\r').trim();
+    let first = text[ls0..le0]
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .trim();
     if first != "---" {
         return (None, text);
     }
     for &(ls, le) in spans.iter().skip(1) {
-        let line = text[ls..le].trim_end_matches('\n').trim_end_matches('\r').trim();
+        let line = text[ls..le]
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .trim();
         if line == "---" {
             let fm = &text[le0..ls];
             let body = &text[le.min(text.len())..];
@@ -565,8 +577,18 @@ fn synthesize_from_frontmatter(rel_path_no_ext: &str, fm: &str) -> String {
 }
 
 const NOISY_KEYS: &[&str] = &[
-    "imdbId", "imdb_id", "url", "cover", "image", "coordinates", "created",
-    "modified", "published", "last", "id", "uuid",
+    "imdbId",
+    "imdb_id",
+    "url",
+    "cover",
+    "image",
+    "coordinates",
+    "created",
+    "modified",
+    "published",
+    "last",
+    "id",
+    "uuid",
 ];
 
 fn clean_yaml_value(s: &str) -> String {
@@ -604,15 +626,30 @@ mod tests {
         let chunks = chunker().chunk(text, "note.md");
         let edges = chunker().edges(text, "note.md", &chunks);
         let targets: Vec<&str> = edges.iter().map(|e| e.target_symbol.as_str()).collect();
-        assert!(targets.contains(&"Other Note"), "bare wikilink: {targets:?}");
-        assert!(targets.contains(&"Deep Note"), "path wikilink basename: {targets:?}");
+        assert!(
+            targets.contains(&"Other Note"),
+            "bare wikilink: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"Deep Note"),
+            "path wikilink basename: {targets:?}"
+        );
         assert!(targets.contains(&"Aliased"), "alias stripped: {targets:?}");
-        assert!(targets.contains(&"Sectioned"), "heading stripped: {targets:?}");
+        assert!(
+            targets.contains(&"Sectioned"),
+            "heading stripped: {targets:?}"
+        );
         assert!(targets.contains(&"target"), "md-link basename: {targets:?}");
         // folder/Deep Note carries a path; bare Other Note does not.
-        let deep = edges.iter().find(|e| e.target_symbol == "Deep Note").unwrap();
+        let deep = edges
+            .iter()
+            .find(|e| e.target_symbol == "Deep Note")
+            .unwrap();
         assert_eq!(deep.target_path.as_deref(), Some("folder/Deep Note"));
-        let other = edges.iter().find(|e| e.target_symbol == "Other Note").unwrap();
+        let other = edges
+            .iter()
+            .find(|e| e.target_symbol == "Other Note")
+            .unwrap();
         assert_eq!(other.target_path, None);
         assert!(edges.iter().all(|e| e.kind == EdgeKind::Wikilink));
     }
@@ -624,7 +661,10 @@ mod tests {
         let edges = chunker().edges(text, "n.md", &chunks);
         let targets: Vec<&str> = edges.iter().map(|e| e.target_symbol.as_str()).collect();
         assert!(targets.contains(&"Linked"));
-        assert!(!targets.contains(&"FencedLink"), "fenced link must be skipped: {targets:?}");
+        assert!(
+            !targets.contains(&"FencedLink"),
+            "fenced link must be skipped: {targets:?}"
+        );
     }
 
     #[test]

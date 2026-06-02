@@ -61,11 +61,10 @@ impl Chunker for CodexChunker {
         let mut project_name = String::new();
         for r in &records {
             if r.v.get("type").and_then(Value::as_str) == Some("session_meta") {
-                if let Some(cwd) = r
-                    .v
-                    .get("payload")
-                    .and_then(|p| p.get("cwd"))
-                    .and_then(Value::as_str)
+                if let Some(cwd) =
+                    r.v.get("payload")
+                        .and_then(|p| p.get("cwd"))
+                        .and_then(Value::as_str)
                 {
                     project_name = std::path::Path::new(cwd)
                         .file_name()
@@ -78,7 +77,9 @@ impl Chunker for CodexChunker {
         // Tool-name lookup for function_call_output (which only carries call_id).
         let mut tool_names: HashMap<String, String> = HashMap::new();
         for r in &records {
-            let Some(p) = r.v.get("payload") else { continue };
+            let Some(p) = r.v.get("payload") else {
+                continue;
+            };
             if p.get("type").and_then(Value::as_str) == Some("function_call") {
                 if let (Some(call_id), Some(name)) = (
                     p.get("call_id").and_then(Value::as_str),
@@ -97,7 +98,9 @@ impl Chunker for CodexChunker {
             if ty != "response_item" {
                 continue; // skip session_meta, event_msg, turn_context
             }
-            let Some(p) = r.v.get("payload") else { continue };
+            let Some(p) = r.v.get("payload") else {
+                continue;
+            };
             let p_type = p.get("type").and_then(Value::as_str).unwrap_or("");
 
             // User message → open a new turn.
@@ -105,12 +108,11 @@ impl Chunker for CodexChunker {
                 if let Some(t) = current.take() {
                     turns.push(t);
                 }
-                let timestamp = r
-                    .v
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let timestamp =
+                    r.v.get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                 let user_text = render_message_content(p);
                 current = Some(Turn {
                     timestamp,
@@ -136,13 +138,13 @@ impl Chunker for CodexChunker {
                         turn.events.push(txt);
                     }
                 }
-                "reasoning" => {
-                    if self.include_reasoning {
-                        let summary = render_reasoning(p);
-                        if !summary.is_empty() {
-                            turn.events
-                                .push(format!("[reasoning] {}", truncate(&summary, TOOL_RESULT_TRUNC)));
-                        }
+                "reasoning" if self.include_reasoning => {
+                    let summary = render_reasoning(p);
+                    if !summary.is_empty() {
+                        turn.events.push(format!(
+                            "[reasoning] {}",
+                            truncate(&summary, TOOL_RESULT_TRUNC)
+                        ));
                     }
                 }
                 "function_call" => {
@@ -363,14 +365,22 @@ mod tests {
     #[test]
     fn three_turns_yields_three_chunks() {
         let jsonl = concat!(
-            r#"{"timestamp":"2026-03-07T20:21:20.607Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-07T20:21:20.607Z","cwd":"/Users/me/Dev/myproj","cli_version":"0.110.0"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:22.425Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:23.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first reply"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:22:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second prompt"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:22:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls -la\"}","call_id":"call_1"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:22:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Chunk ID: x\nWall time: 0.01 seconds\nProcess exited with code 0\nOutput:\ntotal 808\ndrwxr-xr-x"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:23:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third prompt"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:23:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"third reply"}]}}"#, "\n",
+            r#"{"timestamp":"2026-03-07T20:21:20.607Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-07T20:21:20.607Z","cwd":"/Users/me/Dev/myproj","cli_version":"0.110.0"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:22.425Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:23.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first reply"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:22:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second prompt"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:22:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls -la\"}","call_id":"call_1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:22:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Chunk ID: x\nWall time: 0.01 seconds\nProcess exited with code 0\nOutput:\ntotal 808\ndrwxr-xr-x"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:23:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third prompt"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:23:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"third reply"}]}}"#,
+            "\n",
         );
         let chunks = make(false).chunk(jsonl, "myproj/rollout-...jsonl");
         assert_eq!(chunks.len(), 3);
@@ -395,7 +405,11 @@ mod tests {
         );
         assert!(chunks[2].content.contains("third reply"));
         for c in &chunks {
-            assert!(c.heading_path.starts_with("myproj"), "got: {}", c.heading_path);
+            assert!(
+                c.heading_path.starts_with("myproj"),
+                "got: {}",
+                c.heading_path
+            );
             assert!(c.heading_path.contains("2026-03-07"));
             assert!(c.heading_path.ends_with("· codex"));
         }
@@ -404,10 +418,14 @@ mod tests {
     #[test]
     fn reasoning_blocks_skipped_by_default() {
         let jsonl = concat!(
-            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"INTERNAL_SECRET_PLAN"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:24Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible reply"}]}}"#, "\n",
+            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"INTERNAL_SECRET_PLAN"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:24Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible reply"}]}}"#,
+            "\n",
         );
         let chunks = make(false).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);
@@ -418,10 +436,14 @@ mod tests {
     #[test]
     fn reasoning_blocks_included_when_opted_in() {
         let jsonl = concat!(
-            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"REASONING_DETAIL"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:24Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reply"}]}}"#, "\n",
+            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"REASONING_DETAIL"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:24Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reply"}]}}"#,
+            "\n",
         );
         let chunks = make(true).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);
@@ -432,10 +454,13 @@ mod tests {
     fn malformed_lines_are_skipped() {
         let jsonl = concat!(
             "not json\n",
-            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#, "\n",
+            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#,
+            "\n",
             "{also broken\n",
-            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"yo"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#, "\n",
+            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"yo"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+            "\n",
         );
         let chunks = make(false).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);
@@ -446,12 +471,18 @@ mod tests {
     #[test]
     fn event_msg_and_turn_context_skipped() {
         let jsonl = concat!(
-            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:21Z","type":"event_msg","payload":{"type":"task_started"}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:21Z","type":"turn_context","payload":{}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"event_msg","payload":{"type":"token_count","total":1234}}"#, "\n",
-            r#"{"timestamp":"2026-03-07T20:21:24Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#, "\n",
+            r#"{"timestamp":"2026-03-07T20:21:20Z","type":"session_meta","payload":{"cwd":"/x"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:21Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:21Z","type":"turn_context","payload":{}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:22Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:23Z","type":"event_msg","payload":{"type":"token_count","total":1234}}"#,
+            "\n",
+            r#"{"timestamp":"2026-03-07T20:21:24Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#,
+            "\n",
         );
         let chunks = make(false).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);

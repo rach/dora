@@ -394,7 +394,7 @@ fn standard_body(tool: &str) -> String {
 ///   1. `find "natural phrase"` — single arg containing whitespace.
 ///   2. `find <dir> "natural phrase"` — dir + whitespace-containing arg; the path-aware form
 ///      that mirrors the `grep -r "phrase" <dir>` shape from v0.2.4.
-/// Anything else (flags, multiple paths, paths without a quoted phrase) → real find.
+///      Anything else (flags, multiple paths, paths without a quoted phrase) → real find.
 fn find_body() -> String {
     let begin = marker_begin("find");
     let end = marker_end("find");
@@ -509,9 +509,9 @@ fn inject_zsh_wrappers(home: &Path, wraps: &[String]) -> ShellAction {
     }
 
     // Step 3: only write if something actually changed.
-    let need_write = ops.iter().any(|(_, op)| {
-        !matches!(op, WrapperOp::AlreadyUpToDate | WrapperOp::UnknownTool)
-    });
+    let need_write = ops
+        .iter()
+        .any(|(_, op)| !matches!(op, WrapperOp::AlreadyUpToDate | WrapperOp::UnknownTool));
     if need_write {
         if let Err(e) = atomic_write(&zshrc, text.as_bytes()) {
             return ShellAction::Skipped(format!("write .zshrc: {e}"));
@@ -533,7 +533,11 @@ fn block_span(text: &str, tool: &str) -> Option<(usize, usize)> {
 
 /// Remove `text[start..end]` plus a single trailing newline if present (keeps the file tidy).
 fn strip_block(text: &str, start: usize, end: usize) -> String {
-    let trailing_nl = if text.as_bytes().get(end) == Some(&b'\n') { 1 } else { 0 };
+    let trailing_nl = if text.as_bytes().get(end) == Some(&b'\n') {
+        1
+    } else {
+        0
+    };
     let mut out = String::with_capacity(text.len() - (end - start) - trailing_nl);
     out.push_str(&text[..start]);
     out.push_str(&text[end + trailing_nl..]);

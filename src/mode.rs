@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::config::{ChunkingConfig, EmbedderConfig, VaultConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     Obsidian,
@@ -26,13 +26,8 @@ pub enum Mode {
     /// function_call/output records differ from claude-code, hence a peer mode.
     Codex,
     /// Resolved at indexing time by `Mode::detect`.
+    #[default]
     Auto,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Auto
-    }
 }
 
 impl Mode {
@@ -142,11 +137,7 @@ impl Mode {
     }
 
     pub fn vault_defaults(&self) -> VaultConfig {
-        let mut ignore: Vec<String> = vec![
-            ".dora".into(),
-            ".git".into(),
-            "node_modules".into(),
-        ];
+        let mut ignore: Vec<String> = vec![".dora".into(), ".git".into(), "node_modules".into()];
         match self {
             Mode::Obsidian => {
                 ignore.push(".obsidian".into());
@@ -186,7 +177,9 @@ impl Mode {
         match self {
             Mode::Obsidian | Mode::Notes => &["md"],
             Mode::Docs => &["md", "mdx", "rst"],
-            Mode::Code => &["rs", "py", "pyi", "ts", "tsx", "js", "jsx", "go", "java", "rb"],
+            Mode::Code => &[
+                "rs", "py", "pyi", "ts", "tsx", "js", "jsx", "go", "java", "rb",
+            ],
             Mode::ClaudeCode | Mode::Codex => &["jsonl"],
             Mode::Auto => &["md"], // shouldn't be reached after resolve()
         }
@@ -238,7 +231,9 @@ struct DetectCounts {
     md: usize,
 }
 
-const CODE_EXTS: &[&str] = &["rs", "py", "pyi", "ts", "tsx", "js", "jsx", "go", "java", "rb"];
+const CODE_EXTS: &[&str] = &[
+    "rs", "py", "pyi", "ts", "tsx", "js", "jsx", "go", "java", "rb",
+];
 const MD_EXTS: &[&str] = &["md", "mdx", "rst"];
 
 fn count_extensions(root: &Path) -> DetectCounts {
@@ -250,8 +245,16 @@ fn count_extensions(root: &Path) -> DetectCounts {
         .filter_entry(|e| {
             if e.file_type().is_dir() {
                 let name = e.file_name().to_string_lossy();
-                !["target", "node_modules", ".git", ".venv", "dist", "build", ".dora"]
-                    .contains(&name.as_ref())
+                ![
+                    "target",
+                    "node_modules",
+                    ".git",
+                    ".venv",
+                    "dist",
+                    "build",
+                    ".dora",
+                ]
+                .contains(&name.as_ref())
             } else {
                 true
             }

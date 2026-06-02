@@ -138,15 +138,16 @@ pub fn compute(conn: &Connection, focus_paths: &[String]) -> Result<HashMap<i64,
     let seed: HashMap<i64, f64> = file_paths
         .keys()
         .map(|id| {
-            let boost = if focus_ids.contains(id) { FOCUS_BOOST } else { 1.0 };
+            let boost = if focus_ids.contains(id) {
+                FOCUS_BOOST
+            } else {
+                1.0
+            };
             (*id, boost)
         })
         .collect();
 
-    let edges: Vec<(i64, i64, f64)> = weighted
-        .into_iter()
-        .map(|((s, d), w)| (s, d, w))
-        .collect();
+    let edges: Vec<(i64, i64, f64)> = weighted.into_iter().map(|((s, d), w)| (s, d, w)).collect();
 
     Ok(compute_ppr(&edges, &seed, ITERATIONS, DAMPING))
 }
@@ -255,15 +256,22 @@ mod tests {
     fn ppr_concentrates_mass_on_seed_neighborhood() {
         // Two disjoint triangles. Seed node 1 → mass should pool in {1,2,3}, not {4,5,6}.
         let edges = vec![
-            (1, 2, 1.0), (2, 3, 1.0), (3, 1, 1.0),
-            (4, 5, 1.0), (5, 6, 1.0), (6, 4, 1.0),
+            (1, 2, 1.0),
+            (2, 3, 1.0),
+            (3, 1, 1.0),
+            (4, 5, 1.0),
+            (5, 6, 1.0),
+            (6, 4, 1.0),
         ];
         let mut seed = HashMap::new();
         seed.insert(1i64, 1.0);
         let r = compute_ppr(&edges, &seed, 30, 0.85);
         let near: f64 = [1, 2, 3].iter().map(|i| r[i]).sum();
         let far: f64 = [4, 5, 6].iter().map(|i| r[i]).sum();
-        assert!(near > far * 3.0, "seed cluster {near} should dominate far cluster {far}");
+        assert!(
+            near > far * 3.0,
+            "seed cluster {near} should dominate far cluster {far}"
+        );
     }
 
     #[test]

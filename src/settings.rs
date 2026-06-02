@@ -44,8 +44,8 @@ impl Settings {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("read settings {}", path.display()))?;
-        let s: Settings = toml::from_str(&text)
-            .with_context(|| format!("parse settings {}", path.display()))?;
+        let s: Settings =
+            toml::from_str(&text).with_context(|| format!("parse settings {}", path.display()))?;
         Ok(s)
     }
 
@@ -65,7 +65,6 @@ impl Settings {
 }
 
 pub fn settings_path() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine $HOME"))?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine $HOME"))?;
     Ok(home.join(".config").join("dora").join(SETTINGS_FILENAME))
 }

@@ -87,8 +87,8 @@ pub fn run(sources: Vec<Source>) -> Result<()> {
     // picked up without a restart. Watching the dir (not the file) handles atomic
     // rename writes correctly — the rename surfaces as a Create on the final path.
     // Sibling files (watch.pid, future configs) get filtered out by exact-path match.
-    let registry_path = registry::registry_path()
-        .context("resolve registry path for reload-watch")?;
+    let registry_path =
+        registry::registry_path().context("resolve registry path for reload-watch")?;
     let registry_dir = registry_path
         .parent()
         .map(Path::to_path_buf)
@@ -209,7 +209,10 @@ fn try_load(src: &Source, cache: &mut HashMap<String, DynEmbedder>) -> Result<So
 
     let db = db_path(&root);
     if !db.exists() {
-        anyhow::bail!(".dora/index.db not found — run `dora index {}` first", root.display());
+        anyhow::bail!(
+            ".dora/index.db not found — run `dora index {}` first",
+            root.display()
+        );
     }
     let store = Store::open(&db, embedder.dims())?;
     check_meta(&store, embedder.as_ref())?;
@@ -272,7 +275,11 @@ fn reload_sources(
                         src.name
                     );
                 }
-                eprintln!("dora watch: + source '{}' ({})", ctx.name, ctx.root.display());
+                eprintln!(
+                    "dora watch: + source '{}' ({})",
+                    ctx.name,
+                    ctx.root.display()
+                );
                 roots.push((ctx.name.clone(), ctx.root.clone()));
                 ctxs.push(ctx);
             }

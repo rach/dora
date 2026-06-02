@@ -50,7 +50,7 @@ pub fn list_entries(
         }
         let ext = entry.path().extension().and_then(|s| s.to_str());
         let Some(ext) = ext else { continue };
-        if !allow_exts.iter().any(|e| *e == ext) {
+        if !allow_exts.contains(&ext) {
             continue;
         }
 

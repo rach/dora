@@ -93,12 +93,11 @@ impl Chunker for ClaudeCodeChunker {
                     if let Some(t) = current.take() {
                         turns.push(t);
                     }
-                    let timestamp = r
-                        .v
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    let timestamp =
+                        r.v.get("timestamp")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                     current = Some(Turn {
                         timestamp,
                         start_byte: r.start_byte,
@@ -242,22 +241,17 @@ fn render_assistant_message(v: &Value, include_thinking: bool, out: &mut Vec<Str
                     }
                 }
             }
-            "thinking" => {
-                if include_thinking {
-                    if let Some(t) = b.get("thinking").and_then(Value::as_str) {
-                        let trimmed = t.trim();
-                        if !trimmed.is_empty() {
-                            out.push(format!("[thinking] {trimmed}"));
-                        }
+            "thinking" if include_thinking => {
+                if let Some(t) = b.get("thinking").and_then(Value::as_str) {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        out.push(format!("[thinking] {trimmed}"));
                     }
                 }
             }
             "tool_use" => {
                 let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
-                let input_summary = b
-                    .get("input")
-                    .map(summarize_tool_input)
-                    .unwrap_or_default();
+                let input_summary = b.get("input").map(summarize_tool_input).unwrap_or_default();
                 if input_summary.is_empty() {
                     out.push(format!("[tool: {name}]"));
                 } else {
@@ -340,11 +334,7 @@ fn build_heading(project: &str, timestamp: &str, branch: &str) -> String {
     let short_ts = timestamp
         .split_once('T')
         .map(|(date, rest)| {
-            let hm = rest
-                .split(':')
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(":");
+            let hm = rest.split(':').take(2).collect::<Vec<_>>().join(":");
             format!("{date} {hm}")
         })
         .unwrap_or_else(|| timestamp.to_string());
@@ -373,12 +363,18 @@ mod tests {
     #[test]
     fn three_turns_yields_three_chunks() {
         let jsonl = concat!(
-            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/Users/me/Dev/myproj","gitBranch":"main","message":{"role":"user","content":"first prompt"}}"#, "\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first reply"}]}}"#, "\n",
-            r#"{"type":"user","timestamp":"2026-05-25T10:01:00Z","cwd":"/Users/me/Dev/myproj","message":{"role":"user","content":"second prompt"}}"#, "\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"second reply"},{"type":"tool_use","name":"Read","input":{"file_path":"/Users/me/foo.rs"}}]}}"#, "\n",
-            r#"{"type":"user","timestamp":"2026-05-25T10:02:00Z","cwd":"/Users/me/Dev/myproj","message":{"role":"user","content":"third prompt"}}"#, "\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"third reply"}]}}"#, "\n",
+            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/Users/me/Dev/myproj","gitBranch":"main","message":{"role":"user","content":"first prompt"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first reply"}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-05-25T10:01:00Z","cwd":"/Users/me/Dev/myproj","message":{"role":"user","content":"second prompt"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"second reply"},{"type":"tool_use","name":"Read","input":{"file_path":"/Users/me/foo.rs"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-05-25T10:02:00Z","cwd":"/Users/me/Dev/myproj","message":{"role":"user","content":"third prompt"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"third reply"}]}}"#,
+            "\n",
         );
         let chunker = make_chunker(false);
         let chunks = chunker.chunk(jsonl, "myproj/session.jsonl");
@@ -390,7 +386,11 @@ mod tests {
         assert!(chunks[2].content.contains("third reply"));
         // heading_path carries project + timestamp
         for c in &chunks {
-            assert!(c.heading_path.starts_with("myproj"), "got: {}", c.heading_path);
+            assert!(
+                c.heading_path.starts_with("myproj"),
+                "got: {}",
+                c.heading_path
+            );
             assert!(c.heading_path.contains("2026-05-25"));
             assert!(c.heading_path.contains("branch:main"));
         }
@@ -399,8 +399,10 @@ mod tests {
     #[test]
     fn thinking_blocks_skipped_by_default() {
         let jsonl = concat!(
-            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/x","message":{"role":"user","content":"hi"}}"#, "\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"INTERNAL_SECRET_PLAN"},{"type":"text","text":"visible reply"}]}}"#, "\n",
+            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/x","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"INTERNAL_SECRET_PLAN"},{"type":"text","text":"visible reply"}]}}"#,
+            "\n",
         );
         let chunks = make_chunker(false).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);
@@ -422,9 +424,11 @@ mod tests {
     fn malformed_lines_are_skipped() {
         let jsonl = concat!(
             "not json\n",
-            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/x","message":{"role":"user","content":"hi"}}"#, "\n",
+            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/x","message":{"role":"user","content":"hi"}}"#,
+            "\n",
             "{also not json\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"yo"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"yo"}]}}"#,
+            "\n",
         );
         let chunks = make_chunker(false).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);
@@ -434,11 +438,16 @@ mod tests {
     #[test]
     fn system_and_attachment_records_skipped() {
         let jsonl = concat!(
-            r#"{"type":"attachment","attachment":{"foo":"bar"}}"#, "\n",
-            r#"{"type":"permission-mode","permissionMode":"auto"}"#, "\n",
-            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/x","message":{"role":"user","content":"hello"}}"#, "\n",
-            r#"{"type":"system","content":"a system reminder"}"#, "\n",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}]}}"#, "\n",
+            r#"{"type":"attachment","attachment":{"foo":"bar"}}"#,
+            "\n",
+            r#"{"type":"permission-mode","permissionMode":"auto"}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-05-25T10:00:00Z","cwd":"/x","message":{"role":"user","content":"hello"}}"#,
+            "\n",
+            r#"{"type":"system","content":"a system reminder"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}]}}"#,
+            "\n",
         );
         let chunks = make_chunker(false).chunk(jsonl, "x.jsonl");
         assert_eq!(chunks.len(), 1);

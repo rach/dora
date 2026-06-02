@@ -84,15 +84,6 @@ fn registry() -> Vec<LanguageSpec> {
     ]
 }
 
-/// All code-source extensions across the registry. Mirrors `Mode::Code` extensions —
-/// re-exposed here so `vault::list_entries` can use the registry as the source of truth.
-pub fn code_extensions() -> Vec<&'static str> {
-    registry()
-        .iter()
-        .flat_map(|s| s.extensions.iter().copied())
-        .collect()
-}
-
 // ---------- chunker ----------
 
 pub struct CodeChunker {
@@ -138,9 +129,7 @@ impl CodeChunker {
     /// arrives without the dot, so we infer extension from a sibling helper or — easier —
     /// dispatch in `chunk()` where the caller still has the path.
     fn entry_for(&self, ext: &str) -> Option<&LangEntry> {
-        self.configs
-            .iter()
-            .find(|e| e.extensions.iter().any(|x| *x == ext))
+        self.configs.iter().find(|e| e.extensions.contains(&ext))
     }
 
     fn parse_chunks_and_edges(
@@ -288,8 +277,11 @@ fn build_chunks_and_edges(
     // For O(log n) enclosing lookup we'd sort + binary search; defs.len() is small per file
     // (~hundreds), so a linear walk is fine and clearer.
     for r in &refs {
-        let owner_idx = innermost_enclosing(&defs, r.range_start)
-            .or(if chunks.is_empty() { None } else { Some(0) });
+        let owner_idx = innermost_enclosing(&defs, r.range_start).or(if chunks.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
         let Some(idx) = owner_idx else { continue };
         edges.push(EdgeSpec {
             source_chunk_idx: idx,
@@ -408,7 +400,10 @@ fn map_ref_kind(name: &str) -> EdgeKind {
 
 fn file_basename(rel_path: &str) -> String {
     let base = rel_path.rsplit(['/', '\\']).next().unwrap_or(rel_path);
-    base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base).to_string()
+    base.rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(base)
+        .to_string()
 }
 
 fn guess_ext(rel_path_no_ext: &str) -> String {
@@ -471,7 +466,9 @@ mod tests {
             overlap_bytes: 270,
         });
         let chunks = chunker.chunk(src, "g.rb");
-        assert!(chunks.iter().any(|c| c.symbol.as_deref() == Some("Greeter")));
+        assert!(chunks
+            .iter()
+            .any(|c| c.symbol.as_deref() == Some("Greeter")));
         assert!(chunks.iter().any(|c| c.symbol.as_deref() == Some("Hello")));
         assert!(chunks.iter().any(|c| c.symbol.as_deref() == Some("say")));
     }
