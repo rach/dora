@@ -233,13 +233,18 @@ fn run_eval_in_temp(
     top_k: usize,
 ) -> Result<(EvalMetrics, Vec<EvalOutcome>)> {
     copy_docs(&fixture.join("docs"), temp_root)?;
-    fs::create_dir_all(crate::dora_dir(temp_root))?;
+    // Eval deliberately keeps a co-located `.dora/` inside its ephemeral temp source root —
+    // it's throwaway, never registered, never migrated, so it stays decoupled from the
+    // production centralized resolver in paths.rs / main.rs.
+    let eval_dora = temp_root.join(".dora");
+    fs::create_dir_all(&eval_dora)?;
 
-    let cfg = Config::load_or_default(temp_root).context("load eval config")?;
+    let cfg = Config::load_or_default(temp_root, &eval_dora.join("config.toml"))
+        .context("load eval config")?;
     let model_dir = eval_models_dir(temp_root)?;
     let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &model_dir)?;
     let chunker: Box<dyn Chunker> = crate::chunk::from_config(&cfg, temp_root);
-    let db = crate::db_path(temp_root);
+    let db = eval_dora.join("index.db");
     if db.exists() && !crate::meta_matches(&db, embedder.as_ref())? {
         fs::remove_file(&db).context("remove stale eval index")?;
     }
@@ -360,7 +365,7 @@ fn make_temp_root() -> Result<PathBuf> {
 fn eval_models_dir(fallback_root: &Path) -> Result<PathBuf> {
     let dir = dirs::cache_dir()
         .map(|p| p.join("dora").join("eval-models"))
-        .unwrap_or_else(|| crate::models_dir(fallback_root));
+        .unwrap_or_else(|| fallback_root.join(".dora").join("models"));
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }

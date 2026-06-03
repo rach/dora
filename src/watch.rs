@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::embed::{self, DynEmbedder};
 use crate::registry::{self, Registry, Source};
 use crate::store::Store;
-use crate::{check_meta, db_path, models_dir, run_incremental_index};
+use crate::{check_meta, migrate_source_if_legacy, paths, run_incremental_index};
 
 const IGNORE_DIR_NAMES: &[&str] = &[".dora", ".obsidian", ".git", "node_modules"];
 const DEBOUNCE_MS: u64 = 500;
@@ -195,22 +195,24 @@ fn try_load(src: &Source, cache: &mut HashMap<String, DynEmbedder>) -> Result<So
         .path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", src.path.display()))?;
-    let cfg = Config::load_or_default(&root)?;
+    migrate_source_if_legacy(&src.name, &root)?;
+    let cfg = Config::load_or_default(&root, &paths::config_path(&src.name)?)?;
     let key = embed::cache_key(&cfg.embedder);
     let embedder = match cache.get(&key) {
         Some(e) => e.clone(),
         None => {
-            let new = embed::from_config(&cfg.embedder, &models_dir(&root))?;
+            let new = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
             cache.insert(key, new.clone());
             new
         }
     };
     let chunker = chunk::from_config(&cfg, &root);
 
-    let db = db_path(&root);
+    let db = paths::db_path(&src.name)?;
     if !db.exists() {
         anyhow::bail!(
-            ".dora/index.db not found — run `dora index {}` first",
+            "source '{}' isn't indexed yet — run `dora index {}` first",
+            src.name,
             root.display()
         );
     }

@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::embed::{self, DynEmbedder};
 use crate::registry::{Registry, Source};
 use crate::store::Store;
-use crate::{check_meta, db_path, models_dir};
+use crate::{check_meta, migrate_source_if_legacy, paths};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchArgs {
@@ -1374,27 +1374,6 @@ fn truncate_utf8(body: String, max_bytes: usize) -> (String, bool) {
     (body[..cut].to_string(), true)
 }
 
-/// Single-source MCP server (used by `dora mcp --source <path>`). Builds a synthetic
-/// one-entry registry and reuses `run_multi`'s implementation. Always stdio — single-source
-/// is a one-off interactive path; HTTP daemon is meant for the multi-source registry.
-pub async fn run(source_root: &Path) -> Result<()> {
-    let source_root = source_root
-        .canonicalize()
-        .context("canonicalize source path")?;
-    let name = source_root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "source".to_string());
-    let registry = Registry {
-        sources: vec![Source {
-            name,
-            path: source_root,
-            description: None,
-        }],
-    };
-    run_multi(registry, Transport::Stdio).await
-}
-
 fn build_state(sources: &[Source]) -> Result<MultiSourceState> {
     let mut cache: HashMap<String, DynEmbedder> = HashMap::new();
     let mut map: HashMap<String, SourceState> = HashMap::new();
@@ -1428,22 +1407,25 @@ fn try_load_source(src: &Source, cache: &mut HashMap<String, DynEmbedder>) -> Re
         .path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", src.path.display()))?;
-    let cfg = Config::load_or_default(&path).context("load config")?;
+    migrate_source_if_legacy(&src.name, &path)?;
+    let cfg =
+        Config::load_or_default(&path, &paths::config_path(&src.name)?).context("load config")?;
     let key = embed::cache_key(&cfg.embedder);
     let embedder = match cache.get(&key) {
         Some(e) => e.clone(),
         None => {
-            let new = embed::from_config(&cfg.embedder, &models_dir(&path))?;
+            let new = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
             cache.insert(key, new.clone());
             new
         }
     };
     let chunker = chunk::from_config(&cfg, &path);
 
-    let db = db_path(&path);
+    let db = paths::db_path(&src.name)?;
     if !db.exists() {
         anyhow::bail!(
-            ".dora/index.db not found — run `dora index {}` first",
+            "source '{}' isn't indexed yet — run `dora index {}` first",
+            src.name,
             path.display()
         );
     }

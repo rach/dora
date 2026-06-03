@@ -44,7 +44,7 @@ Claude > [calls mcp__dora__search]
 
 ## Install
 
-> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux: build from source via `cargo install --git https://github.com/rach/dora --tag v0.8.1`.
+> macOS Apple Silicon (M1 / M2 / M3+). Intel Mac and Linux: build from source via `cargo install --git https://github.com/rach/dora --tag v0.9.0`.
 
 ### Homebrew (recommended)
 
@@ -57,7 +57,7 @@ The first run auto-taps `rach/homebrew-dora`. Upgrade with `brew upgrade dora`.
 ### Direct download
 
 ```sh
-curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.8.1-macos-arm64
+curl -L -o /tmp/dora https://github.com/rach/dora/releases/latest/download/dora-fs-v0.9.0-macos-arm64
 chmod +x /tmp/dora
 xattr -d com.apple.quarantine /tmp/dora 2>/dev/null   # bypass macOS Gatekeeper warning
 sudo mv /tmp/dora /usr/local/bin/dora                  # or anywhere on your $PATH
@@ -67,7 +67,7 @@ dora --version
 Either path lands you at:
 
 ```
-dora 0.8.1
+dora 0.9.0
 ```
 
 > **About the Gatekeeper line** (direct-download path only): the binary isn't code-signed (signing requires a $99/yr Apple developer account I haven't paid for). The `xattr` line removes the quarantine flag macOS adds to downloads, so it'll launch without complaining. Homebrew's install path doesn't trip Gatekeeper. If you skip the `xattr` on a direct download, the first run shows *"cannot be opened because the developer cannot be verified"* — right-click in Finder → Open → "Open Anyway" gets past it.
@@ -88,7 +88,7 @@ You should see something like:
 indexed: 73 inserted, 0 updated, 0 touched, 0 renamed, 0 deleted, 0 unchanged in 14.81s [model: fastembed:Qdrant/bge-base-en-v1.5-onnx-Q]
 ```
 
-What just happened: dora walked `~/notes`, chunked each `.md` file, embedded each chunk using a small local ML model (auto-downloads ~80 MB the first time, cached for next time), and stored the result in `~/notes/.dora/index.db`. The first run takes seconds-to-minutes depending on vault size. Subsequent runs are basically instant for unchanged files.
+What just happened: dora walked `~/notes`, chunked each `.md` file, embedded each chunk using a small local ML model (auto-downloads ~33 MB the first time into `~/.dora/models`, shared across all sources), registered the folder, and stored the index at `~/.dora/sources/notes/index.db` — nothing is written inside `~/notes` itself. The first run takes seconds-to-minutes depending on vault size. Subsequent runs are basically instant for unchanged files.
 
 ### Step 2 — Register the folder so dora knows about it globally
 
@@ -280,17 +280,32 @@ dora's incremental indexing means re-running `dora index` is cheap. Queries also
 
 ## What's happening under the hood
 
+As of v0.9, dora keeps **zero footprint inside your folders** — your notes/repo
+stay clean. Everything dora writes lives under `~/.dora` (override with
+`$DORA_HOME`):
+
 ```
-~/your-notes/
-├── note.md                ← you write these
-├── deep/folder/...
-└── .dora/                 ← dora writes here only (gitignorable)
-    ├── index.db           ← local SQLite database with the search index
-    └── models/            ← downloaded ML model (~33 MB, one time)
+~/your-notes/              ← only your files; no .dora/ here
+├── note.md
+└── deep/folder/...
+
+~/.dora/
+├── sources/
+│   └── your-notes/        ← keyed by the registered source name
+│       ├── index.db       ← local SQLite database with the search index
+│       └── config.toml    ← this source's mode / embedder / chunking
+├── models/                ← downloaded ML models (~33 MB), SHARED across sources
+└── source-roots           ← path list the shell wrappers use for discovery
 
 ~/.config/dora/
 └── registry.toml          ← list of folders you've registered
 ```
+
+> **Upgrading from v0.8 or earlier?** Pre-0.9 installs stored this co-located at
+> `<source>/.dora/`. dora migrates each source out automatically the first time
+> you touch it (search/index/serve), or migrate them all at once with
+> `dora migrate`. After upgrading, run `dora install` once so the refreshed shell
+> wrappers pick up the new discovery file.
 
 ### Retrieval pipeline
 
@@ -325,7 +340,7 @@ Numbers from maintainer evals (`~/.dora-eval-hard/`, 20 docs, 53 queries — eas
 
 OpenAI is supported via `provider = "openai"` (`text-embedding-3-small` / `text-embedding-3-large` / `ada-002`). Pay-per-use, no local model, costs surface in the index summary.
 
-To switch, edit `<source>/.dora/config.toml`:
+To switch, edit the source's config at `~/.dora/sources/<name>/config.toml`:
 
 ```toml
 [embedder]
@@ -664,7 +679,7 @@ dora mcp --source ~/some/ad-hoc/folder    # ad-hoc, ignoring the registry
 
 ### Wrapped tools
 
-After `dora install`, inside any folder with a `.dora/index.db`:
+After `dora install`, inside any registered dora source (or a subfolder of one):
 
 ```sh
 grep "natural language query"            # → semantic search via dora

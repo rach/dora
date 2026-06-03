@@ -205,10 +205,12 @@ struct RawCodexConfig {
 // ---------- loader ----------
 
 impl Config {
-    pub fn load_or_default(source_root: &Path) -> Result<Self> {
-        let path = source_root.join(".dora").join("config.toml");
-        let raw: RawConfig = if path.exists() {
-            let text = std::fs::read_to_string(&path)?;
+    /// Load a source's config. `source_root` is the folder being indexed (drives mode
+    /// auto-detection, which reads the folder's contents); `config_path` is the centralized
+    /// `~/.dora/sources/<name>/config.toml` where the file actually lives.
+    pub fn load_or_default(source_root: &Path, config_path: &Path) -> Result<Self> {
+        let raw: RawConfig = if config_path.exists() {
+            let text = std::fs::read_to_string(config_path)?;
             toml::from_str(&text)?
         } else {
             RawConfig::default()

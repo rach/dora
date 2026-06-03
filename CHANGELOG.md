@@ -6,8 +6,34 @@ All notable changes to dora are documented here. Format roughly follows
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-03
+
+### Changed
+
+- **Centralized index storage.** Per-source data now lives under `~/.dora`
+  (`~/.dora/sources/<name>/index.db` + `config.toml`) instead of a `.dora/`
+  directory inside each indexed folder, with a single shared model cache at
+  `~/.dora/models/`. This keeps vaults and repos free of any `.dora/` footprint
+  (no accidental git commits, no cloud-sync corrupting the index) and stops the
+  embedder weights from being duplicated per source. Override the root with
+  `$DORA_HOME`.
+- Sources are now keyed by their registered name. `dora index <path>` and
+  `dora mcp --source <path>` auto-register the folder if it isn't already in the
+  registry, and read commands resolve the owning source from any working
+  directory (including deep subfolders) by longest-prefix match.
+- The shell wrappers discover dora sources via a denormalized
+  `~/.dora/source-roots` file (a fixed-string membership check) instead of
+  statting `.dora/index.db`. Re-run `dora install` after upgrading so the
+  `~/.zshrc` block is refreshed.
+
 ### Added
 
+- **Automatic migration.** Pre-0.9 co-located `<source>/.dora/` indexes are moved
+  into the centralized layout on first touch (db + WAL sidecars, config, and
+  model subtrees, deduped into the shared cache), leaving zero footprint behind.
+- `dora migrate` sweeps every registered source at once.
+- `dora source rename <old> <new>` renames a source and moves its store dir.
+- `dora source remove --purge` also deletes the source's index data.
 - Added a committed `fixtures/eval/linked` corpus with 26 linked notes and 12
   associative queries for graph-PPR evaluation.
 - Added debug-only `dora eval --compare-disable-graph`, which runs a fixture with
@@ -17,7 +43,7 @@ All notable changes to dora are documented here. Format roughly follows
   opening documents in the browser.
 - Added `dora mcp --http --no-web` to run only the MCP HTTP transport.
 
-### Changed
+### Changed (tooling)
 
 - Replaced the old qmd-oriented `scripts/eval.sh` with a committed dora-only gate
   covering notes, code, and linked graph fixtures.

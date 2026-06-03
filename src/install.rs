@@ -332,10 +332,10 @@ fn standard_body(tool: &str) -> String {
 # dora {tool} wrapper — routes to dora's semantic search when the invocation is shaped like
 # "search this folder for this pattern". Specifically: allow `-r -R -i -n -H` (in any combo
 # like `-rin`); take the first non-flag arg as the pattern; treat any subsequent non-flag
-# args as paths (default: PWD). If every path is a directory that sits inside a folder with
-# `.dora/index.db`, route to `dora "$pattern"` from that source root. Anything else (other
-# flags, file paths, paths outside a dora source) falls through to the real {tool}. Disable
-# with `dora wrappers off`.
+# args as paths (default: PWD). If every path is a directory inside a registered dora source
+# (listed in ~/.dora/source-roots), route to `dora "$pattern"` from that source root. Anything
+# else (other flags, file paths, paths outside a dora source) falls through to the real {tool}.
+# Disable with `dora wrappers off`.
 {tool}() {{
     dora wrappers status -q 2>/dev/null || {{ command {tool} "$@"; return; }}
     local _dora_pattern="" _dora_seen=0 _dora_arg _dora_flag _dora_ch
@@ -365,6 +365,8 @@ fn standard_body(tool: &str) -> String {
     done
     [ "$_dora_seen" = 1 ] || {{ command {tool} "$@"; return; }}
     [ ${{#_dora_paths[@]}} -eq 0 ] && _dora_paths=("$PWD")
+    local _dora_roots="${{DORA_HOME:-$HOME/.dora}}/source-roots"
+    [ -f "$_dora_roots" ] || {{ command {tool} "$@"; return; }}
     local _dora_root="" _dora_p _dora_abs _dora_dir _dora_found
     for _dora_p in "${{_dora_paths[@]}}"; do
         [ -d "$_dora_p" ] || {{ command {tool} "$@"; return; }}
@@ -372,7 +374,7 @@ fn standard_body(tool: &str) -> String {
         _dora_dir="$_dora_abs"
         _dora_found=""
         while [ "$_dora_dir" != "/" ]; do
-            if [ -f "$_dora_dir/.dora/index.db" ]; then
+            if command grep -qxF "$_dora_dir" "$_dora_roots" 2>/dev/null; then
                 _dora_found="$_dora_dir"
                 break
             fi
@@ -424,11 +426,13 @@ find() {{
     else
         command find "$@"; return
     fi
+    local _dora_roots="${{DORA_HOME:-$HOME/.dora}}/source-roots"
+    [ -f "$_dora_roots" ] || {{ command find "$@"; return; }}
     local _dora_abs _dora_dir _dora_found=""
     _dora_abs="$(cd "$_dora_path" 2>/dev/null && pwd)" || {{ command find "$@"; return; }}
     _dora_dir="$_dora_abs"
     while [ "$_dora_dir" != "/" ]; do
-        if [ -f "$_dora_dir/.dora/index.db" ]; then
+        if command grep -qxF "$_dora_dir" "$_dora_roots" 2>/dev/null; then
             _dora_found="$_dora_dir"
             break
         fi
@@ -626,4 +630,26 @@ pub fn render_report(r: &InstallReport) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrappers_discover_via_source_roots_not_colocated_db() {
+        for body in [standard_body("grep"), standard_body("rg"), find_body()] {
+            // Discovery now reads the centralized roots file via a fixed-string membership check.
+            assert!(body.contains("source-roots"), "missing source-roots ref");
+            assert!(
+                body.contains("command grep -qxF"),
+                "missing fixed-string membership check (or recursing into the grep wrapper)"
+            );
+            // The old co-located stat must be gone — post-migration folders have no `.dora/`.
+            assert!(
+                !body.contains(".dora/index.db"),
+                "wrapper still stats the legacy co-located index"
+            );
+        }
+    }
 }

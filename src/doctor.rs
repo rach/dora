@@ -240,15 +240,23 @@ fn check_registry() -> Vec<Check> {
     let now = now_secs();
     for src in &reg.sources {
         let label = format!("  {}", src.name);
-        let db = src.path.join(".dora").join("index.db");
+        let db = crate::paths::db_path(&src.name).unwrap_or_default();
+        let legacy = crate::paths::legacy_dir(&src.path).join("index.db");
         if !db.exists() {
+            // A pre-0.9 co-located index that hasn't been migrated yet reads as "not indexed"
+            // here — point the user at `dora migrate` instead of a confusing reindex.
+            let detail = if legacy.exists() {
+                format!(
+                    "pre-0.9 index still at {} — run `dora migrate`",
+                    legacy.display()
+                )
+            } else {
+                format!("not indexed — run `dora index {}`", src.path.display())
+            };
             out.push(Check {
                 status: CheckStatus::Err,
                 label,
-                detail: format!(
-                    "no .dora/index.db at {} — run `dora index`",
-                    src.path.display()
-                ),
+                detail,
             });
             continue;
         }
@@ -279,7 +287,8 @@ fn check_registry() -> Vec<Check> {
             .unwrap_or(0);
 
         // What the current binary + this source's config expect:
-        let cfg = Config::load_or_default(&src.path).unwrap_or_default();
+        let cfg_path = crate::paths::config_path(&src.name).unwrap_or_default();
+        let cfg = Config::load_or_default(&src.path, &cfg_path).unwrap_or_default();
         let expected_embedder_prefix = match cfg.embedder.provider.as_str() {
             "fastembed" => format!("fastembed:Xenova/{}", cfg.embedder.model),
             other => format!("{}:{}", other, cfg.embedder.model),

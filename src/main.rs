@@ -10,6 +10,7 @@ mod mcp;
 mod migrations;
 mod mode;
 mod pagerank;
+mod paths;
 mod registry;
 mod search;
 mod settings;
@@ -188,6 +189,9 @@ enum Command {
     /// Report the health of the install: binary, registry, MCP host registration,
     /// shell wrapper, watcher status.
     Doctor,
+    /// Migrate pre-0.9 co-located `<source>/.dora/` indexes into the centralized
+    /// `~/.dora/sources/<name>/` layout. Sweeps every registered source; idempotent.
+    Migrate,
     /// Foreground file-watcher that keeps registered sources fresh. Runs until Ctrl-C.
     /// Same `--include` / `--exclude` semantics as `dora mcp`.
     Watch {
@@ -314,7 +318,8 @@ enum InstallClient {
 
 #[derive(Subcommand)]
 enum SourceAction {
-    /// Register an indexed source. Path must already contain `.dora/index.db`.
+    /// Register a source (or update its metadata if already registered). The folder does not
+    /// need to be indexed first — register, then run `dora index`.
     Add {
         /// Absolute or relative path to the source root.
         path: PathBuf,
@@ -325,13 +330,26 @@ enum SourceAction {
         #[arg(long)]
         description: Option<String>,
         /// Indexing mode. `obsidian` / `notes` / `docs` / `code` / `auto` (default).
-        /// Persisted to `.dora/config.toml` as `[source] mode = "..."`. If omitted, the mode
-        /// already in the config file is preserved; if there's no config, auto-detect runs.
+        /// Persisted to the source's central `config.toml` as `[source] mode = "..."`. If
+        /// omitted, the mode already in the config file is preserved; if none, auto-detect runs.
         #[arg(long)]
         mode: Option<String>,
     },
-    /// Remove a source from the registry by name. Doesn't touch the source's `.dora/` dir.
-    Remove { name: String },
+    /// Remove a source from the registry by name. Keeps its index under `~/.dora/sources/<name>`
+    /// unless `--purge` is given.
+    Remove {
+        name: String,
+        /// Also delete the source's index data at `~/.dora/sources/<name>`.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Rename a registered source, moving its `~/.dora/sources/<name>` store to match.
+    Rename {
+        /// Current source name.
+        old: String,
+        /// New source name.
+        new: String,
+    },
     /// List all registered sources.
     List,
     /// Set or clear the description for an existing source.
@@ -381,6 +399,7 @@ fn main() -> Result<()> {
             wrap,
         }) => cmd_install(client, include, exclude, !no_shell, wrap),
         Some(Command::Doctor) => cmd_doctor(),
+        Some(Command::Migrate) => cmd_migrate(),
         Some(Command::Watch { include, exclude }) => cmd_watch(include, exclude),
         Some(Command::Wrappers { action }) => cmd_wrappers(action),
         Some(Command::Context { action }) => cmd_context(action),
@@ -525,7 +544,21 @@ fn cmd_mcp(opts: McpOptions) -> Result<()> {
     };
 
     match opts.source {
-        Some(path) if !opts.http => rt.block_on(mcp::run(&path)),
+        Some(path) if !opts.http => {
+            // Ad-hoc single source: register it (storage is name-keyed) + migrate any legacy
+            // co-located index, then serve a one-entry synthetic registry.
+            let abs = path.canonicalize().context("canonicalize source path")?;
+            let name = ensure_registered(&abs)?;
+            migrate_source_if_legacy(&name, &abs)?;
+            let reg = registry::Registry {
+                sources: vec![registry::Source {
+                    name,
+                    path: abs,
+                    description: None,
+                }],
+            };
+            rt.block_on(mcp::run_multi(reg, transport))
+        }
         Some(_) => {
             bail!("--source is incompatible with --http; HTTP daemon serves the full registry")
         }
@@ -728,14 +761,17 @@ fn cmd_context(action: ContextAction) -> Result<()> {
         let src = reg
             .find_by_name(name)
             .ok_or_else(|| anyhow::anyhow!("no registered source named '{name}'"))?;
-        let cfg = Config::load_or_default(&src.path).context("load config")?;
-        let embedder = embed::from_config(&cfg.embedder, &models_dir(&src.path))?;
-        let db = db_path(&src.path);
+        let root = src.path.canonicalize().unwrap_or_else(|_| src.path.clone());
+        migrate_source_if_legacy(name, &root)?;
+        let cfg =
+            Config::load_or_default(&root, &paths::config_path(name)?).context("load config")?;
+        let embedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
+        let db = paths::db_path(name)?;
         if !db.exists() {
             bail!(
-                ".dora/index.db not found at {}. Run `dora index {}` first.",
-                src.path.display(),
-                src.path.display()
+                "source '{name}' isn't indexed yet ({} missing). Run `dora index {}` first.",
+                db.display(),
+                root.display()
             );
         }
         Store::open(&db, embedder.dims())
@@ -799,6 +835,41 @@ fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+fn cmd_migrate() -> Result<()> {
+    let reg = registry::Registry::load().context("load registry")?;
+    if reg.sources.is_empty() {
+        println!("(no sources registered — nothing to migrate)");
+        return Ok(());
+    }
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+    for src in &reg.sources {
+        let root = match src.path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip {} ({}): {e}", src.name, src.path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        match migrate_source_if_legacy(&src.name, &root) {
+            Ok(true) => migrated += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                eprintln!("migrate {} failed: {e}", src.name);
+                skipped += 1;
+            }
+        }
+    }
+    // Regenerate the wrapper's source-roots file from the current registry.
+    reg.write_roots_file().ok();
+    println!("migrated {migrated}, skipped {skipped}");
+    if migrated > 0 {
+        println!("run `dora install` to refresh the shell wrappers for the new layout.");
+    }
+    Ok(())
+}
+
 fn cmd_source(action: SourceAction) -> Result<()> {
     match action {
         SourceAction::Add {
@@ -810,26 +881,62 @@ fn cmd_source(action: SourceAction) -> Result<()> {
             let abs = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize {}", path.display()))?;
-            // If --mode was given, write/replace `[source] mode = "..."` in the source's
-            // config.toml *before* checking for the DB — so the user can do "add --mode code"
-            // on an unindexed dir, then run `dora index` and have it pick up the right mode.
+            let desc = description.filter(|s| !s.trim().is_empty());
+            let mut reg = registry::Registry::load().context("load registry")?;
+
+            // Resolve the name first — central config + index are keyed by name. If the path is
+            // already registered, treat `add` as a metadata update (rename is `source rename`).
+            let final_name = if let Some(existing) = reg.find_by_path(&abs) {
+                let nm = existing.name.clone();
+                if desc.is_some() {
+                    reg.set_description(&nm, desc.clone())?;
+                    reg.save().context("write registry")?;
+                }
+                nm
+            } else {
+                let nm = match name {
+                    Some(n) => {
+                        registry::validate_source_name(&n)?;
+                        n
+                    }
+                    None => {
+                        let base = derive_source_name(&abs);
+                        let mut nm = base.clone();
+                        let mut k = 2;
+                        while reg.find_by_name(&nm).is_some() {
+                            nm = format!("{base}-{k}");
+                            k += 1;
+                        }
+                        nm
+                    }
+                };
+                reg.add(registry::Source {
+                    name: nm.clone(),
+                    path: abs.clone(),
+                    description: desc.clone(),
+                })?;
+                reg.save().context("write registry")?;
+                nm
+            };
+
+            migrate_source_if_legacy(&final_name, &abs)?;
+
+            // If --mode was given, write/replace `[source] mode = "..."` in the source's central
+            // config so a later `dora index` picks it up.
             if let Some(mode_str) = mode {
                 let parsed = crate::mode::Mode::parse(&mode_str).ok_or_else(|| {
                     anyhow::anyhow!(
                         "invalid mode '{mode_str}'. valid: obsidian|notes|docs|code|auto"
                     )
                 })?;
-                write_source_mode(&abs, parsed.as_str())?;
+                write_source_mode(&paths::config_path(&final_name)?, parsed.as_str())?;
                 let resolved = crate::mode::Mode::resolve(&Some(mode_str.clone()), &abs);
                 println!(
                     "mode: {} ({})",
                     resolved.as_str(),
                     crate::mode::detection_summary(&abs)
                 );
-            } else if !abs.join(".dora").join("config.toml").exists() {
-                // No explicit mode, no existing config — auto-detect + print what we'd choose
-                // so the user can confirm. Don't write the file: leaving config absent means
-                // `dora index` will re-detect each run, which is friendlier for evolving dirs.
+            } else if !paths::config_path(&final_name)?.exists() {
                 let detected = crate::mode::Mode::detect(&abs);
                 println!(
                     "mode: {} (auto-detected — {})",
@@ -837,35 +944,14 @@ fn cmd_source(action: SourceAction) -> Result<()> {
                     crate::mode::detection_summary(&abs)
                 );
             }
-            let db = abs.join(".dora").join("index.db");
-            if !db.exists() {
-                bail!(
-                    "{} has no `.dora/index.db`. Run `dora index {}` first.",
-                    abs.display(),
+
+            println!("added: {} -> {}", final_name, abs.display());
+            if !paths::db_path(&final_name)?.exists() {
+                eprintln!(
+                    "hint: '{final_name}' isn't indexed yet — run `dora index {}`.",
                     abs.display()
                 );
             }
-            let final_name = name.unwrap_or_else(|| {
-                // Transcript-mode source roots have generic basenames (`projects`,
-                // `sessions`) — use the mode name as a friendlier default.
-                let resolved_mode = crate::mode::Mode::detect(&abs);
-                match resolved_mode {
-                    crate::mode::Mode::ClaudeCode => "claude-code".to_string(),
-                    crate::mode::Mode::Codex => "codex".to_string(),
-                    _ => abs
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "source".to_string()),
-                }
-            });
-            let mut reg = registry::Registry::load().context("load registry")?;
-            reg.add(registry::Source {
-                name: final_name.clone(),
-                path: abs.clone(),
-                description: description.filter(|s| !s.trim().is_empty()),
-            })?;
-            reg.save().context("write registry")?;
-            println!("added: {} -> {}", final_name, abs.display());
             // Surface a one-line nudge about watch — uses kill -0 liveness so a stale
             // PID file from a crashed watcher doesn't give the wrong hint.
             if crate::watch::is_running() {
@@ -879,11 +965,55 @@ fn cmd_source(action: SourceAction) -> Result<()> {
             }
             Ok(())
         }
-        SourceAction::Remove { name } => {
+        SourceAction::Remove { name, purge } => {
             let mut reg = registry::Registry::load().context("load registry")?;
             let removed = reg.remove(&name)?;
             reg.save().context("write registry")?;
-            println!("removed: {} ({})", removed.name, removed.path.display());
+            if purge {
+                let dir = paths::source_store_dir(&removed.name)?;
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)
+                        .with_context(|| format!("remove {}", dir.display()))?;
+                }
+                println!(
+                    "removed + purged: {} ({})",
+                    removed.name,
+                    removed.path.display()
+                );
+            } else {
+                println!(
+                    "removed: {} ({}) — index kept at {}",
+                    removed.name,
+                    removed.path.display(),
+                    paths::source_store_dir(&removed.name)?.display()
+                );
+            }
+            Ok(())
+        }
+        SourceAction::Rename { old, new } => {
+            registry::validate_source_name(&new)?;
+            let mut reg = registry::Registry::load().context("load registry")?;
+            if reg.find_by_name(&new).is_some() {
+                bail!("source name '{new}' already registered");
+            }
+            reg.find_by_name(&old)
+                .ok_or_else(|| anyhow::anyhow!("no source named '{old}'"))?;
+            // Move the central store dir to match the new name.
+            let from = paths::source_store_dir(&old)?;
+            let to = paths::source_store_dir(&new)?;
+            if to.exists() {
+                bail!("{} already exists", to.display());
+            }
+            if from.exists() {
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::rename(&from, &to)
+                    .with_context(|| format!("rename {} -> {}", from.display(), to.display()))?;
+            }
+            reg.rename(&old, &new)?;
+            reg.save().context("write registry")?;
+            println!("renamed: {old} -> {new}");
             Ok(())
         }
         SourceAction::List => {
@@ -901,7 +1031,7 @@ fn cmd_source(action: SourceAction) -> Result<()> {
                 .max(4);
             println!("{:<width$}  STATUS  PATH", "NAME", width = name_w);
             for s in &reg.sources {
-                let indexed = s.path.join(".dora").join("index.db").exists();
+                let indexed = paths::db_path(&s.name).map(|p| p.exists()).unwrap_or(false);
                 let status = if indexed { "✓" } else { "✗" };
                 println!(
                     "{:<width$}  {}      {}",
@@ -934,16 +1064,6 @@ fn cmd_source(action: SourceAction) -> Result<()> {
     }
 }
 
-pub(crate) fn dora_dir(vault: &Path) -> PathBuf {
-    vault.join(".dora")
-}
-pub(crate) fn db_path(vault: &Path) -> PathBuf {
-    dora_dir(vault).join("index.db")
-}
-pub(crate) fn models_dir(vault: &Path) -> PathBuf {
-    dora_dir(vault).join("models")
-}
-
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -956,16 +1076,19 @@ fn now_secs() -> u64 {
 fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
     let started = Instant::now();
     let vault = vault.canonicalize().context("canonicalize vault path")?;
-    std::fs::create_dir_all(dora_dir(&vault))?;
+    let name = ensure_registered(&vault)?;
+    migrate_source_if_legacy(&name, &vault)?;
+    std::fs::create_dir_all(paths::source_store_dir(&name)?)?;
 
-    let cfg = Config::load_or_default(&vault).context("load config")?;
-    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&vault))?;
+    let cfg =
+        Config::load_or_default(&vault, &paths::config_path(&name)?).context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
     let chunker: BoxedChunker = chunk::from_config(&cfg, &vault);
 
     // If the existing DB was built with a different schema/chunker/embedder, drop it and
     // rebuild from scratch (the diff loop will then see "all files = Insert"). No external
     // users → no migration code needed.
-    let db = db_path(&vault);
+    let db = paths::db_path(&name)?;
     if db.exists() && !meta_matches(&db, embedder.as_ref())? {
         std::fs::remove_file(&db).context("remove stale index.db")?;
     }
@@ -1016,28 +1139,24 @@ struct CliSearchOptions {
 }
 
 fn cmd_search(cwd: &Path, query: &str, cli_opts: CliSearchOptions) -> Result<()> {
-    let source_root = cwd.canonicalize()?;
-    let db = db_path(&source_root);
+    let (source_name, source_root) = resolve_source_for_cwd(cwd)?;
+    migrate_source_if_legacy(&source_name, &source_root)?;
+    let db = paths::db_path(&source_name)?;
     if !db.exists() {
         bail!(
-            ".dora/index.db not found in {}. Run `dora index` first.",
+            "source '{}' isn't indexed yet ({} missing). Run `dora index {}` first.",
+            source_name,
+            db.display(),
             source_root.display()
         );
     }
 
-    let cfg = Config::load_or_default(&source_root).context("load config")?;
-    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+    let cfg = Config::load_or_default(&source_root, &paths::config_path(&source_name)?)
+        .context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
     let mut store = Store::open(&db, embedder.dims())?;
     check_meta(&store, embedder.as_ref())?;
     let chunker: BoxedChunker = chunk::from_config(&cfg, &source_root);
-
-    // Derive source name: if cwd is registered, use the registered name; else use basename.
-    let source_name = registry::find_source_name_for_path(&source_root).unwrap_or_else(|| {
-        source_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "source".to_string())
-    });
 
     let top_k = cli_opts.top_k_override.unwrap_or(cfg.search.top_k);
     let opts = search::SearchOptions {
@@ -1093,26 +1212,24 @@ fn cmd_search(cwd: &Path, query: &str, cli_opts: CliSearchOptions) -> Result<()>
 }
 
 fn cmd_explain(cwd: &Path, query: &str, top_k_override: Option<usize>, json: bool) -> Result<()> {
-    let source_root = cwd.canonicalize()?;
-    let db = db_path(&source_root);
+    let (source_name, source_root) = resolve_source_for_cwd(cwd)?;
+    migrate_source_if_legacy(&source_name, &source_root)?;
+    let db = paths::db_path(&source_name)?;
     if !db.exists() {
         bail!(
-            ".dora/index.db not found in {}. Run `dora index` first.",
+            "source '{}' isn't indexed yet ({} missing). Run `dora index {}` first.",
+            source_name,
+            db.display(),
             source_root.display()
         );
     }
 
-    let cfg = Config::load_or_default(&source_root).context("load config")?;
-    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+    let cfg = Config::load_or_default(&source_root, &paths::config_path(&source_name)?)
+        .context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
     let mut store = Store::open(&db, embedder.dims())?;
     check_meta(&store, embedder.as_ref())?;
     let chunker: BoxedChunker = chunk::from_config(&cfg, &source_root);
-    let source_name = registry::find_source_name_for_path(&source_root).unwrap_or_else(|| {
-        source_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "source".to_string())
-    });
 
     if now_secs().saturating_sub(
         store
@@ -1333,16 +1450,20 @@ impl AnsiStyle {
 // ---------------- backlinks (Layer A graph) ----------------
 
 fn cmd_backlinks(cwd: &Path, path: &str) -> Result<()> {
-    let source_root = cwd.canonicalize()?;
-    let db = db_path(&source_root);
+    let (source_name, source_root) = resolve_source_for_cwd(cwd)?;
+    migrate_source_if_legacy(&source_name, &source_root)?;
+    let db = paths::db_path(&source_name)?;
     if !db.exists() {
         bail!(
-            ".dora/index.db not found in {}. Run `dora index` first.",
+            "source '{}' isn't indexed yet ({} missing). Run `dora index {}` first.",
+            source_name,
+            db.display(),
             source_root.display()
         );
     }
-    let cfg = Config::load_or_default(&source_root).context("load config")?;
-    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+    let cfg = Config::load_or_default(&source_root, &paths::config_path(&source_name)?)
+        .context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
     let store = Store::open(&db, embedder.dims())?;
 
     let inbound = store.backlinks(path)?;
@@ -1373,17 +1494,20 @@ fn cmd_backlinks(cwd: &Path, path: &str) -> Result<()> {
 fn cmd_graph(cwd: &Path, action: GraphAction) -> Result<()> {
     match action {
         GraphAction::Rebuild => {
-            let source_root = cwd.canonicalize()?;
-            let db = db_path(&source_root);
+            let (source_name, source_root) = resolve_source_for_cwd(cwd)?;
+            migrate_source_if_legacy(&source_name, &source_root)?;
+            let db = paths::db_path(&source_name)?;
             if !db.exists() {
                 bail!(
-                    ".dora/index.db not found in {}. Run `dora index` first.",
+                    "source '{}' isn't indexed yet ({} missing). Run `dora index {}` first.",
+                    source_name,
+                    db.display(),
                     source_root.display()
                 );
             }
-            let cfg = Config::load_or_default(&source_root).context("load config")?;
-            let embedder: DynEmbedder =
-                embed::from_config(&cfg.embedder, &models_dir(&source_root))?;
+            let cfg = Config::load_or_default(&source_root, &paths::config_path(&source_name)?)
+                .context("load config")?;
+            let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
             let store = Store::open(&db, embedder.dims())?;
             let started = Instant::now();
             let n = graph::rebuild_derived_edges(&store, cfg.graph.entities)?;
@@ -1851,16 +1975,194 @@ pub(crate) fn check_meta(store: &Store, embedder: &dyn Embedder) -> Result<()> {
     Ok(())
 }
 
-/// Write `[source] mode = "<value>"` into `<root>/.dora/config.toml`, preserving every
+// ---------------- source identity, registration, migration ----------------
+
+/// Friendly default name for a source root: its basename, except transcript dirs whose
+/// basenames are generic (`projects`, `sessions`) get their mode name instead.
+fn derive_source_name(root: &Path) -> String {
+    match crate::mode::Mode::detect(root) {
+        crate::mode::Mode::ClaudeCode => "claude-code".to_string(),
+        crate::mode::Mode::Codex => "codex".to_string(),
+        _ => root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "source".to_string()),
+    }
+}
+
+/// Ensure the canonicalized `root` is in the registry; return its name. With centralized,
+/// name-keyed storage an index has nowhere to live until the source has a name, so `dora index`
+/// (and ad-hoc `dora mcp --source`) auto-register rather than erroring. Reuses the existing
+/// entry if the path is already registered; otherwise picks a basename-derived, collision-
+/// deduped name.
+fn ensure_registered(root: &Path) -> Result<String> {
+    let mut reg = registry::Registry::load().context("load registry")?;
+    if let Some(s) = reg.find_by_path(root) {
+        return Ok(s.name.clone());
+    }
+    let base = derive_source_name(root);
+    let mut name = base.clone();
+    let mut n = 2;
+    while reg.find_by_name(&name).is_some() {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    reg.add(registry::Source {
+        name: name.clone(),
+        path: root.to_path_buf(),
+        description: None,
+    })?;
+    reg.save().context("write registry")?;
+    eprintln!("registered: {} -> {}", name, root.display());
+    Ok(name)
+}
+
+/// Resolve the source that owns `cwd` for read commands (search/explain/backlinks/graph).
+/// Order: (1) registry longest-prefix match; (2) legacy fallback — if an un-migrated
+/// `<ancestor>/.dora/index.db` exists, auto-register that ancestor for a smooth pre-0.9
+/// upgrade; (3) error. Returns `(name, canonical source root)`.
+fn resolve_source_for_cwd(cwd: &Path) -> Result<(String, PathBuf)> {
+    let cwd = cwd.canonicalize().context("canonicalize cwd")?;
+    let reg = registry::Registry::load().context("load registry")?;
+    if let Some(s) = reg.resolve_for_path(&cwd) {
+        return Ok((s.name.clone(), s.path.clone()));
+    }
+    let mut dir = cwd.as_path();
+    loop {
+        if paths::legacy_dir(dir).join("index.db").exists() {
+            let root = dir.to_path_buf();
+            let name = ensure_registered(&root)?;
+            return Ok((name, root));
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    bail!(
+        "no registered dora source contains {}. Run `dora index <path>` to index + register it.",
+        cwd.display()
+    );
+}
+
+/// Force a SQLite WAL checkpoint so `index.db` is self-contained before it's moved.
+fn checkpoint_wal(db: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(db)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(())
+}
+
+/// Move a file or directory, falling back to copy+remove when `rename` fails across mounts
+/// (EXDEV — `~/.dora` and the source may be on different volumes). The source is removed only
+/// after the destination is in place.
+fn move_path(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if from.is_dir() {
+        copy_dir_recursive(from, to)?;
+        std::fs::remove_dir_all(from)?;
+    } else {
+        std::fs::copy(from, to)
+            .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+        std::fs::remove_file(from)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move a pre-0.9 co-located `<root>/.dora` store into the centralized location keyed by
+/// `name`. Idempotent and crash-safe; returns `Ok(false)` when there's nothing to migrate.
+/// Called at the top of every command that opens a source so existing installs upgrade on
+/// first touch with no user action.
+fn migrate_source_if_legacy(name: &str, root: &Path) -> Result<bool> {
+    let legacy = paths::legacy_dir(root);
+    let legacy_db = legacy.join("index.db");
+    if !legacy_db.exists() {
+        return Ok(false); // already migrated, or never co-located
+    }
+    let central_dir = paths::source_store_dir(name)?;
+    let central_db = paths::db_path(name)?;
+
+    // Both present → the central copy wins (a fresh `dora index` rebuilds cheaply). Drop legacy.
+    if central_db.exists() {
+        std::fs::remove_dir_all(&legacy)
+            .with_context(|| format!("remove stale legacy {}", legacy.display()))?;
+        return Ok(true);
+    }
+
+    std::fs::create_dir_all(&central_dir)
+        .with_context(|| format!("create {}", central_dir.display()))?;
+
+    // Checkpoint the WAL so all data is in index.db, then move db + sidecars.
+    checkpoint_wal(&legacy_db).ok();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = legacy.join(format!("index.db{suffix}"));
+        if from.exists() {
+            move_path(&from, &central_dir.join(format!("index.db{suffix}")))?;
+        }
+    }
+    // Move the per-source config.
+    let legacy_cfg = legacy.join("config.toml");
+    if legacy_cfg.exists() {
+        move_path(&legacy_cfg, &paths::config_path(name)?)?;
+    }
+    // Move model subtrees into the shared cache; drop any that are already cached (dedup).
+    let legacy_models = legacy.join("models");
+    if legacy_models.is_dir() {
+        let shared = paths::models_root()?;
+        std::fs::create_dir_all(&shared).ok();
+        for entry in std::fs::read_dir(&legacy_models)? {
+            let entry = entry?;
+            let dest = shared.join(entry.file_name());
+            if dest.exists() {
+                if entry.path().is_dir() {
+                    std::fs::remove_dir_all(entry.path()).ok();
+                } else {
+                    std::fs::remove_file(entry.path()).ok();
+                }
+            } else {
+                move_path(&entry.path(), &dest)?;
+            }
+        }
+    }
+    // Everything moved — drop the now-empty legacy dir, leaving zero footprint in the folder.
+    std::fs::remove_dir_all(&legacy)
+        .with_context(|| format!("remove migrated legacy {}", legacy.display()))?;
+    eprintln!(
+        "migrated {name}: moved index out of {} → {}",
+        legacy.display(),
+        central_dir.display()
+    );
+    Ok(true)
+}
+
+// ---------------- config writer ----------------
+
+/// Write `[source] mode = "<value>"` into the source's central `config.toml`, preserving every
 /// other line in the file. If the file doesn't exist yet, creates a minimal one. We do
 /// line-level surgery rather than load → mutate → toml::to_string because the TOML library
 /// drops comments + formatting on round-trip, which would be hostile to user-edited files.
-fn write_source_mode(root: &Path, mode: &str) -> Result<()> {
-    let dora = root.join(".dora");
-    std::fs::create_dir_all(&dora).with_context(|| format!("mkdir {}", dora.display()))?;
-    let path = dora.join("config.toml");
+fn write_source_mode(config_path: &Path, mode: &str) -> Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let path = config_path;
     let existing = if path.exists() {
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
     } else {
         String::new()
     };
@@ -1911,7 +2213,7 @@ fn write_source_mode(root: &Path, mode: &str) -> Result<()> {
         out.push_str(&new_assignment);
         out.push('\n');
     }
-    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -1924,4 +2226,49 @@ fn sha256_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+#[cfg(test)]
+mod migrate_tests {
+    use std::sync::Mutex;
+
+    // `DORA_HOME` is process-global; serialize env-touching tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn migrates_legacy_store_into_central() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("DORA_HOME", home.path());
+
+        // A fake source folder carrying a pre-0.9 co-located `.dora/`.
+        let srcdir = tempfile::tempdir().unwrap();
+        let legacy = srcdir.path().join(".dora");
+        let model_subtree = legacy.join("models").join("models--acme--m1");
+        std::fs::create_dir_all(&model_subtree).unwrap();
+        std::fs::write(legacy.join("index.db"), b"fake-sqlite").unwrap();
+        std::fs::write(legacy.join("config.toml"), "[source]\nmode = \"notes\"\n").unwrap();
+        std::fs::write(model_subtree.join("w.bin"), b"weights").unwrap();
+
+        let moved = super::migrate_source_if_legacy("testsrc", srcdir.path()).unwrap();
+        assert!(moved);
+
+        // Central store now holds the db + config; the folder is left with zero footprint.
+        let central = crate::paths::source_store_dir("testsrc").unwrap();
+        assert!(central.join("index.db").exists());
+        assert!(central.join("config.toml").exists());
+        assert!(!srcdir.path().join(".dora").exists());
+
+        // Model subtree landed in the shared cache.
+        assert!(crate::paths::models_root()
+            .unwrap()
+            .join("models--acme--m1")
+            .join("w.bin")
+            .exists());
+
+        // Idempotent: nothing left to migrate on a second pass.
+        assert!(!super::migrate_source_if_legacy("testsrc", srcdir.path()).unwrap());
+
+        std::env::remove_var("DORA_HOME");
+    }
 }
