@@ -4,7 +4,5 @@
 .claude/
 # local-only release recipe (see scripts/release.sh in this checkout)
 /scripts/release.sh
-# local-only eval harness (see docs/prds/v0.6-prf-eval-usage-logging.md)
-/scripts/eval.sh
 # local-only roadmap + PRDs (planning notes, not part of the shipped repo)
 /docs/

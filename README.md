@@ -550,15 +550,23 @@ dora --json explain "why does the opening sentence matter" | jq .
 Committed retrieval eval harness for contributors. It exists in dev/debug builds
 (`cargo run -- eval fixtures/eval/notes`) and is compiled out of release binaries.
 Fixtures contain `docs/` plus a `queries.toml`; dora reports R@1, R@3, R@5, and MRR.
-Use the ablation flags to test whether PRF or graph boost helped a fixture.
+Use the ablation flags to test whether PRF or graph boost helped a fixture. The
+`linked` fixture is intentionally associative: graph-on should beat graph-off on
+R@5 and MRR while the notes/code fixtures guard single-hop regressions.
 
 ```sh
+scripts/eval.sh
 cargo run -- eval fixtures/eval/notes
 cargo run -- eval fixtures/eval/code
+cargo run -- eval fixtures/eval/linked --compare-disable-graph
 cargo run -- eval fixtures/eval/notes --disable-prf
 cargo run -- eval fixtures/eval/notes --disable-graph --json
 cargo run -- eval fixtures/eval/notes --min-r-at-1 0.8
 ```
+
+Historical qmd/private-fixture numbers in the changelog are context only. The
+committed gate is dora-only so contributors can run it without qmd, ollama, or
+private eval data.
 
 ### `dora source <add|list|remove|describe>`
 

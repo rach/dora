@@ -245,6 +245,9 @@ enum Command {
         /// Disable graph boost for this eval run.
         #[arg(long)]
         disable_graph: bool,
+        /// Run this fixture twice and require graph-on to beat graph-off on R@5 and MRR.
+        #[arg(long)]
+        compare_disable_graph: bool,
     },
 }
 
@@ -395,6 +398,7 @@ fn main() -> Result<()> {
             json,
             disable_prf,
             disable_graph,
+            compare_disable_graph,
         }) => eval::cmd_eval(
             &fixture,
             eval::EvalOptions {
@@ -403,6 +407,7 @@ fn main() -> Result<()> {
                 json,
                 disable_prf,
                 disable_graph,
+                compare_disable_graph,
             },
         ),
         None => {

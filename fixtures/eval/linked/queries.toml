@@ -1,0 +1,59 @@
+[[query]]
+name = "fundraising-runway"
+query = "investor deck asks about dilution tradeoffs"
+relevant = ["fundraising/runway-scenario-plan.md"]
+
+[[query]]
+name = "incident-pager-load"
+query = "after outage action items from postmortem"
+relevant = ["ops/pager-rotation-load.md"]
+
+[[query]]
+name = "onboarding-shadowing"
+query = "new hire ramp plan after first week"
+relevant = ["people/shadowing-map.md"]
+
+[[query]]
+name = "procurement-objections"
+query = "customer interview concerns about procurement"
+relevant = ["sales/objection-library.md"]
+
+[[query]]
+name = "launch-rollback"
+query = "release announcement risk if rollout fails"
+relevant = ["product/rollback-playbook.md"]
+
+[[query]]
+name = "privacy-deletion"
+query = "privacy promise for removing customer data"
+relevant = ["privacy/deletion-queue.md"]
+
+[[query]]
+name = "team-health-handoffs"
+query = "team morale survey complains about handoff churn"
+relevant = ["people/handoff-map.md"]
+
+[[query]]
+name = "architecture-cache"
+query = "architecture review mentions latency spike around reads"
+relevant = ["engineering/cache-invalidation.md"]
+
+[[query]]
+name = "docs-support"
+query = "support tickets say setup guide confuses users"
+relevant = ["docs/troubleshooting-index.md"]
+
+[[query]]
+name = "pricing-migration"
+query = "pricing change requires grandfathering old customers"
+relevant = ["billing/migration-ledger.md"]
+
+[[query]]
+name = "security-audit"
+query = "vendor security questionnaire asks about access controls"
+relevant = ["security/admin-review-log.md"]
+
+[[query]]
+name = "research-roadmap"
+query = "research synthesis points to roadmap bet"
+relevant = ["product/bet-framing.md"]

@@ -47,6 +47,7 @@ pub(crate) struct EvalOptions {
     pub json: bool,
     pub disable_prf: bool,
     pub disable_graph: bool,
+    pub compare_disable_graph: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +58,21 @@ struct EvalReport {
     disable_graph: bool,
     metrics: EvalMetrics,
     outcomes: Vec<EvalOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct EvalMetricDelta {
+    r_at_1: f64,
+    r_at_3: f64,
+    r_at_5: f64,
+    mrr: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalCompareReport {
+    graph_on: EvalReport,
+    graph_off: EvalReport,
+    delta: EvalMetricDelta,
 }
 
 pub(crate) fn cmd_eval(fixture: &Path, opts: EvalOptions) -> Result<()> {
@@ -70,64 +86,144 @@ pub(crate) fn cmd_eval(fixture: &Path, opts: EvalOptions) -> Result<()> {
     if opts.top_k == 0 {
         bail!("--top-k must be at least 1");
     }
+    if opts.compare_disable_graph && opts.disable_graph {
+        bail!("--compare-disable-graph cannot be combined with --disable-graph");
+    }
 
-    let temp_root = make_temp_root()?;
-    let _env = EvalEnv::apply(opts.disable_prf, opts.disable_graph);
-    let result = run_eval_in_temp(&fixture, &temp_root, &eval_file.queries, opts.top_k);
-    let _ = fs::remove_dir_all(&temp_root);
-    let (metrics, outcomes) = result?;
+    let report = run_eval_report(
+        &fixture,
+        &eval_file.queries,
+        opts.top_k,
+        opts.disable_prf,
+        opts.disable_graph,
+    )?;
 
-    let report = EvalReport {
-        fixture: fixture.display().to_string(),
-        top_k: opts.top_k,
-        disable_prf: opts.disable_prf,
-        disable_graph: opts.disable_graph,
-        metrics,
-        outcomes,
-    };
-
-    if opts.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("fixture: {}", report.fixture);
-        println!("top_k: {}", report.top_k);
-        if opts.disable_prf || opts.disable_graph {
+    if opts.compare_disable_graph {
+        let graph_off = run_eval_report(
+            &fixture,
+            &eval_file.queries,
+            opts.top_k,
+            opts.disable_prf,
+            true,
+        )?;
+        let delta = metric_delta(report.metrics, graph_off.metrics);
+        let compare = EvalCompareReport {
+            graph_on: report,
+            graph_off,
+            delta,
+        };
+        if opts.json {
+            println!("{}", serde_json::to_string_pretty(&compare)?);
+        } else {
+            print_report(&compare.graph_on, opts.disable_prf || opts.disable_graph);
+            println!("graph comparison:");
             println!(
-                "ablations: prf={} graph={}",
-                if opts.disable_prf { "off" } else { "on" },
-                if opts.disable_graph { "off" } else { "on" }
+                "  graph-off R@1 {:.3} R@3 {:.3} R@5 {:.3} MRR {:.3}",
+                compare.graph_off.metrics.r_at_1,
+                compare.graph_off.metrics.r_at_3,
+                compare.graph_off.metrics.r_at_5,
+                compare.graph_off.metrics.mrr
+            );
+            println!(
+                "  delta     R@1 {:+.3} R@3 {:+.3} R@5 {:+.3} MRR {:+.3}",
+                compare.delta.r_at_1, compare.delta.r_at_3, compare.delta.r_at_5, compare.delta.mrr
             );
         }
-        println!("queries: {}", report.metrics.queries);
-        println!("R@1: {:.3}", report.metrics.r_at_1);
-        println!("R@3: {:.3}", report.metrics.r_at_3);
-        println!("R@5: {:.3}", report.metrics.r_at_5);
-        println!("MRR: {:.3}", report.metrics.mrr);
-
-        let failures: Vec<&EvalOutcome> = report
-            .outcomes
-            .iter()
-            .filter(|o| o.rank.is_none())
-            .collect();
-        if !failures.is_empty() {
-            println!("misses:");
-            for failure in failures {
-                println!("  {} (top: {:?})", failure.name, failure.top_hit);
+        if compare.delta.r_at_5 <= 0.0 || compare.delta.mrr <= 0.0 {
+            bail!(
+                "graph comparison failed: expected graph-on to beat graph-off on R@5 and MRR \
+                 (delta R@5 {:+.3}, MRR {:+.3})",
+                compare.delta.r_at_5,
+                compare.delta.mrr
+            );
+        }
+        if let Some(min) = opts.min_r_at_1 {
+            if compare.graph_on.metrics.r_at_1 < min {
+                bail!(
+                    "R@1 {:.3} below required threshold {:.3}",
+                    compare.graph_on.metrics.r_at_1,
+                    min
+                );
+            }
+        }
+    } else {
+        if opts.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_report(&report, opts.disable_prf || opts.disable_graph);
+        }
+        if let Some(min) = opts.min_r_at_1 {
+            if report.metrics.r_at_1 < min {
+                bail!(
+                    "R@1 {:.3} below required threshold {:.3}",
+                    report.metrics.r_at_1,
+                    min
+                );
             }
         }
     }
 
-    if let Some(min) = opts.min_r_at_1 {
-        if metrics.r_at_1 < min {
-            bail!(
-                "R@1 {:.3} below required threshold {:.3}",
-                metrics.r_at_1,
-                min
-            );
+    Ok(())
+}
+
+fn run_eval_report(
+    fixture: &Path,
+    queries: &[EvalQuery],
+    top_k: usize,
+    disable_prf: bool,
+    disable_graph: bool,
+) -> Result<EvalReport> {
+    let temp_root = make_temp_root()?;
+    let _env = EvalEnv::apply(disable_prf, disable_graph);
+    let result = run_eval_in_temp(fixture, &temp_root, queries, top_k);
+    let _ = fs::remove_dir_all(&temp_root);
+    let (metrics, outcomes) = result?;
+    Ok(EvalReport {
+        fixture: fixture.display().to_string(),
+        top_k,
+        disable_prf,
+        disable_graph,
+        metrics,
+        outcomes,
+    })
+}
+
+fn print_report(report: &EvalReport, show_ablations: bool) {
+    println!("fixture: {}", report.fixture);
+    println!("top_k: {}", report.top_k);
+    if show_ablations {
+        println!(
+            "ablations: prf={} graph={}",
+            if report.disable_prf { "off" } else { "on" },
+            if report.disable_graph { "off" } else { "on" }
+        );
+    }
+    println!("queries: {}", report.metrics.queries);
+    println!("R@1: {:.3}", report.metrics.r_at_1);
+    println!("R@3: {:.3}", report.metrics.r_at_3);
+    println!("R@5: {:.3}", report.metrics.r_at_5);
+    println!("MRR: {:.3}", report.metrics.mrr);
+
+    let failures: Vec<&EvalOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|o| o.rank.is_none())
+        .collect();
+    if !failures.is_empty() {
+        println!("misses:");
+        for failure in failures {
+            println!("  {} (top: {:?})", failure.name, failure.top_hit);
         }
     }
+}
 
-    Ok(())
+fn metric_delta(on: EvalMetrics, off: EvalMetrics) -> EvalMetricDelta {
+    EvalMetricDelta {
+        r_at_1: on.r_at_1 - off.r_at_1,
+        r_at_3: on.r_at_3 - off.r_at_3,
+        r_at_5: on.r_at_5 - off.r_at_5,
+        mrr: on.mrr - off.mrr,
+    }
 }
 
 fn run_eval_in_temp(

@@ -4,6 +4,20 @@ All notable changes to dora are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added a committed `fixtures/eval/linked` corpus with 26 linked notes and 12
+  associative queries for graph-PPR evaluation.
+- Added debug-only `dora eval --compare-disable-graph`, which runs a fixture with
+  graph-on and graph-off and fails unless graph-on improves R@5 and MRR.
+
+### Changed
+
+- Replaced the old qmd-oriented `scripts/eval.sh` with a committed dora-only gate
+  covering notes, code, and linked graph fixtures.
+
 ## [0.8.1] — 2026-06-02
 
 ### Added
@@ -71,10 +85,10 @@ on every search.
   (weighted by RRF score), spreads across the wikilink + derived-edge graph, and
   adds a bounded boost (cap +0.03) so graph-central chunks surface. Edge weights
   authored-dominate: wikilink 1.0, entity 0.6, keyphrase 0.5, similarity 0.3.
-  Wikilinks are symmetrized (reverse at 0.5). On the 53-query flat fixture (no
-  authored links): R@1 lifts **0.943 → 0.962**, MRR **0.965 → 0.974** — the boost
-  is net-positive even where the PRD predicted break-even. `DORA_DISABLE_GRAPH=1`
-  is an A/B switch.
+  Wikilinks are symmetrized (reverse at 0.5). Historical private-fixture evals
+  showed a positive graph boost; current committed graph validation lives in
+  `fixtures/eval/linked` via `dora eval --compare-disable-graph`.
+  `DORA_DISABLE_GRAPH=1` remains an A/B switch.
 - **`compute_ppr` engine.** Extracted from `pagerank.rs::compute()` as a generic
   Personalized-PageRank engine over `(edges, seed)`. `repo_map`'s code-symbol
   PageRank now delegates to it (bit-identical behavior, "row per file" contract
@@ -140,11 +154,11 @@ Head-to-head on 20 docs / 53 queries (mixed easy / medium / hard, paraphrase-hea
 | **`bge-base-en-v1.5-onnx-q`** *(new default)* | ~33 MB | **0.943** | **0.965** | **1.000** | **~0.15s** |
 | `bge-base-en-v1.5` (full precision) | ~110 MB | 0.925 | 0.956 | 0.950 | ~0.33s |
 | `embeddinggemma-300m-onnx` | ~333 MB | 0.943 | 0.967 | 0.950 | ~2s first |
-| qmd-query (LLM-augmented stack) | — | 0.962 | 0.981 | 0.950 | ~0.65s |
+| qmd-query (LLM-augmented stack, historical private eval) | — | 0.962 | 0.981 | 0.950 | ~0.65s |
 
-dora's hybrid (bge-base-Q + FTS + literal + PRF) closes the gap to qmd's full
-LLM-augmented pipeline to **1.9 pts on R@1** with no LLM dependency, and ties
-the larger embeddinggemma model on R@1 at one-tenth the size.
+dora's hybrid (bge-base-Q + FTS + literal + PRF) historically closed the gap to
+qmd's full LLM-augmented pipeline to **1.9 pts on R@1** with no LLM dependency,
+and tied the larger embeddinggemma model on R@1 at one-tenth the size.
 
 ### Migration note
 
@@ -202,14 +216,11 @@ Head-to-head against qmd's published 18-query eval set (`test/eval-docs/`):
 | dora (no PRF)| 18 | 1.000 | 1.000 | 1.000 | 1.000 |
 | ripgrep -l   | 18 |   .056|   .056|   .056|   .056|
 
-dora's hybrid (FTS + vector + literal + PRF) hits perfect R@1 on every easy /
-medium / hard query in qmd's fixture — no LLM, no Python, no ollama. qmd cannot
-exceed 1.000 either, so we're within the PRD's "±5 R@5 points of qmd" acceptance
-window. PRF lands clean (no regression vs. no-PRF on this fixture), but the
-6-doc set is too small to differentiate; PRF's value will surface on diverse
-real-world corpora where multiple docs compete for the same query. The eval
-harness lives at `scripts/eval.sh` (maintainer-only, gitignored) for re-running
-on broader fixtures as v0.7+ lands.
+dora's hybrid (FTS + vector + literal + PRF) hit perfect R@1 on every easy /
+medium / hard query in qmd's fixture — no LLM, no Python, no ollama. This
+head-to-head is historical context; `scripts/eval.sh` now runs the committed
+dora-only notes/code/linked gates so contributors do not need qmd or private
+fixtures.
 
 - **Minimalist colored CLI renderer** with inline previews. `dora "query"`
   now prints one header line per hit (`path:line  [heading]  ★score`, with
