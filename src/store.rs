@@ -703,6 +703,15 @@ impl Store {
         Ok(out)
     }
 
+    pub fn has_file_path(&self, path: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path = ?",
+            params![path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     // ---------- usage logging (v0.6) ----------
 
     /// Append one row to the `usage` table: which query was run, what we returned, with the

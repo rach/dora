@@ -462,23 +462,8 @@ async fn handle_search(
         .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
     let multi = &mut *guard;
 
-    let hits = match args.source {
-        Some(name) => {
-            if !multi.sources.contains_key(&name) {
-                let available = multi.order.join(", ");
-                return Err(ErrorData::invalid_params(
-                    format!("unknown source '{name}'. registered: {available}"),
-                    None,
-                ));
-            }
-            let s = multi.sources.get_mut(&name).expect("checked above");
-            search_one(s, &args.query, opts.clone())
-                .map_err(|e| ErrorData::internal_error(format!("search failed: {e}"), None))?
-        }
-        None => search_cross(multi, &args.query, opts.clone()).map_err(|e| {
-            ErrorData::internal_error(format!("cross-source search failed: {e}"), None)
-        })?,
-    };
+    let hits = run_search_on_state(multi, &args.query, args.source.as_deref(), opts)
+        .map_err(|e| ErrorData::internal_error(format!("search failed: {e}"), None))?;
 
     // Stash this search in the ring buffer so a subsequent `multi_get` can attribute reads
     // back to it. Each `Hit` already knows its source name (set by `search::search`); we
@@ -507,33 +492,8 @@ async fn handle_list_sources(
         .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
     let multi = &mut *guard;
 
-    let mut out: Vec<SourceInfo> = Vec::with_capacity(multi.order.len());
-    for name in multi.order.clone() {
-        let s = multi.sources.get(&name).expect("name in order map exists");
-        let file_count = s
-            .store
-            .count_files()
-            .map_err(|e| ErrorData::internal_error(format!("count_files({name}): {e}"), None))?;
-        let chunk_count = s
-            .store
-            .count_chunks()
-            .map_err(|e| ErrorData::internal_error(format!("count_chunks({name}): {e}"), None))?;
-        let last_indexed_at = s
-            .store
-            .get_meta("last_walk_at")
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<i64>().ok());
-        out.push(SourceInfo {
-            name: s.name.clone(),
-            description: s.description.clone(),
-            path: s.path.display().to_string(),
-            embedder_id: s.embedder.id().to_string(),
-            file_count,
-            chunk_count,
-            last_indexed_at,
-        });
-    }
+    let out = list_sources_on_state(multi)
+        .map_err(|e| ErrorData::internal_error(format!("list sources: {e}"), None))?;
 
     let json = serde_json::to_string(&out)
         .map_err(|e| ErrorData::internal_error(format!("serialize: {e}"), None))?;
@@ -1020,6 +980,52 @@ fn search_one(
     )
 }
 
+fn run_search_on_state(
+    multi: &mut MultiSourceState,
+    query: &str,
+    source: Option<&str>,
+    opts: crate::search::SearchOptions<'_>,
+) -> Result<Vec<crate::search::Hit>> {
+    match source {
+        Some(name) => {
+            if !multi.sources.contains_key(name) {
+                anyhow::bail!(
+                    "unknown source '{name}'. registered: {}",
+                    multi.order.join(", ")
+                );
+            }
+            let s = multi.sources.get_mut(name).expect("checked above");
+            search_one(s, query, opts)
+        }
+        None => search_cross(multi, query, opts),
+    }
+}
+
+fn list_sources_on_state(multi: &MultiSourceState) -> Result<Vec<SourceInfo>> {
+    let mut out: Vec<SourceInfo> = Vec::with_capacity(multi.order.len());
+    for name in multi.order.clone() {
+        let s = multi.sources.get(&name).expect("name in order map exists");
+        let file_count = s.store.count_files()?;
+        let chunk_count = s.store.count_chunks()?;
+        let last_indexed_at = s
+            .store
+            .get_meta("last_walk_at")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok());
+        out.push(SourceInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            path: s.path.display().to_string(),
+            embedder_id: s.embedder.id().to_string(),
+            file_count,
+            chunk_count,
+            last_indexed_at,
+        });
+    }
+    Ok(out)
+}
+
 /// Cross-source: over-fetch per source (2× top_k when capped), then re-sort + apply the
 /// caller's `top_k` / `all` / `min_score` on the merged list. RRF scores are on the same
 /// scale (1/(60+rank)) so direct comparison is defensible.
@@ -1067,7 +1073,10 @@ fn search_cross(
 #[derive(Debug, Clone)]
 pub enum Transport {
     Stdio,
-    Http { bind: std::net::SocketAddr },
+    Http {
+        bind: std::net::SocketAddr,
+        web: bool,
+    },
 }
 
 /// Multi-source MCP server. Loads every source in the registry, sharing embedder instances
@@ -1092,7 +1101,7 @@ pub async fn run_multi(registry: Registry, transport: Transport) -> Result<()> {
                 .context("waiting on MCP service")?;
             Ok(())
         }
-        Transport::Http { bind } => run_http(shared, bind).await,
+        Transport::Http { bind, web } => run_http(shared, bind, web).await,
     }
 }
 
@@ -1100,7 +1109,11 @@ pub async fn run_multi(registry: Registry, transport: Transport) -> Result<()> {
 /// JSON endpoint that `dora doctor` + the daemon-detection helpers in `install.rs` use.
 /// State (the `Arc<Mutex<MultiSourceState>>`) is captured by the service factory closure,
 /// so all sessions share one MultiSourceState — embedders + Stores stay resident.
-async fn run_http(state: Arc<Mutex<MultiSourceState>>, bind: std::net::SocketAddr) -> Result<()> {
+async fn run_http(
+    state: Arc<Mutex<MultiSourceState>>,
+    bind: std::net::SocketAddr,
+    web: bool,
+) -> Result<()> {
     use axum::routing::get;
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
@@ -1124,20 +1137,31 @@ async fn run_http(state: Arc<Mutex<MultiSourceState>>, bind: std::net::SocketAdd
     );
 
     let health_state = state.clone();
-    let app = axum::Router::new()
-        .route(
-            "/health",
-            get(move || {
-                let state = health_state.clone();
-                async move { axum::Json(health_payload(&state, started_at)) }
-            }),
-        )
-        .nest_service("/mcp", svc);
+    let mut app = axum::Router::new().route(
+        "/health",
+        get(move || {
+            let state = health_state.clone();
+            async move { axum::Json(health_payload(&state, started_at)) }
+        }),
+    );
+
+    if web {
+        app = app
+            .route("/", get(web_index))
+            .route("/api/sources", get(api_sources))
+            .route("/api/search", get(api_search))
+            .route("/api/doc", get(api_doc));
+    }
+
+    let app = app.nest_service("/mcp", svc).with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {}", bind))?;
     eprintln!("dora mcp: http listening on http://{}", bind);
+    if web {
+        eprintln!("dora mcp: web UI at http://{}/", bind);
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -1171,6 +1195,183 @@ fn health_payload(
         uptime_secs: started_at.elapsed().as_secs(),
         sources,
     }
+}
+
+async fn web_index() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("web/index.html"))
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSearchParams {
+    q: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiDocParams {
+    source: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiDocResponse {
+    source: String,
+    path: String,
+    content: String,
+    byte_count: usize,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: axum::http::StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let body = axum::Json(serde_json::json!({ "error": self.message }));
+        (self.status, body).into_response()
+    }
+}
+
+async fn api_sources(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<MultiSourceState>>>,
+) -> Result<axum::Json<Vec<SourceInfo>>, ApiError> {
+    let guard = state
+        .lock()
+        .map_err(|e| ApiError::internal(format!("state lock poisoned: {e}")))?;
+    list_sources_on_state(&guard)
+        .map(axum::Json)
+        .map_err(|e| ApiError::internal(format!("list sources: {e}")))
+}
+
+async fn api_search(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<MultiSourceState>>>,
+    axum::extract::Query(p): axum::extract::Query<ApiSearchParams>,
+) -> Result<axum::Json<Vec<crate::search::Hit>>, ApiError> {
+    let query = p.q.trim();
+    if query.is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
+    let top_k = p.top_k.unwrap_or(10).clamp(1, 50) as usize;
+    let output = match p.output.as_deref() {
+        Some("files") => crate::search::OutputMode::Files,
+        Some("chunks") | None => crate::search::OutputMode::Chunks,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "invalid output mode {other:?} (expected 'chunks' or 'files')"
+            )));
+        }
+    };
+    let opts = crate::search::SearchOptions {
+        top_k,
+        output,
+        diagnostics: false,
+        ..Default::default()
+    };
+
+    let source = p.source.as_deref().filter(|s| !s.trim().is_empty());
+    let mut guard = state
+        .lock()
+        .map_err(|e| ApiError::internal(format!("state lock poisoned: {e}")))?;
+    run_search_on_state(&mut guard, query, source, opts)
+        .map(axum::Json)
+        .map_err(|e| ApiError::bad_request(format!("{e}")))
+}
+
+async fn api_doc(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<MultiSourceState>>>,
+    axum::extract::Query(p): axum::extract::Query<ApiDocParams>,
+) -> Result<axum::Json<ApiDocResponse>, ApiError> {
+    const MAX_DOC_BYTES: usize = 1_048_576;
+    let rel = sanitize_doc_path(&p.path)?;
+    let full = {
+        let guard = state
+            .lock()
+            .map_err(|e| ApiError::internal(format!("state lock poisoned: {e}")))?;
+        let s = guard.sources.get(&p.source).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unknown source '{}'. registered: {}",
+                p.source,
+                guard.order.join(", ")
+            ))
+        })?;
+        if !s
+            .store
+            .has_file_path(&rel)
+            .map_err(|e| ApiError::internal(format!("lookup indexed path: {e}")))?
+        {
+            return Err(ApiError::not_found(format!("path not indexed: {rel}")));
+        }
+        s.path.join(&rel)
+    };
+
+    let body = std::fs::read_to_string(&full)
+        .map_err(|e| ApiError::not_found(format!("read {}: {e}", full.display())))?;
+    let byte_count = body.len();
+    let (content, truncated) = truncate_utf8(body, MAX_DOC_BYTES);
+    Ok(axum::Json(ApiDocResponse {
+        source: p.source,
+        path: rel,
+        content,
+        byte_count,
+        truncated,
+    }))
+}
+
+fn sanitize_doc_path(path: &str) -> Result<String, ApiError> {
+    let p = Path::new(path);
+    if path.trim().is_empty() || p.is_absolute() {
+        return Err(ApiError::bad_request(
+            "path must be a relative indexed path",
+        ));
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ApiError::bad_request("path may not contain '..'"));
+    }
+    Ok(path.to_string())
+}
+
+fn truncate_utf8(body: String, max_bytes: usize) -> (String, bool) {
+    if body.len() <= max_bytes {
+        return (body, false);
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (body[..cut].to_string(), true)
 }
 
 /// Single-source MCP server (used by `dora mcp --source <path>`). Builds a synthetic

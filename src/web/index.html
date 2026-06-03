@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dora</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f4ef;
+      --panel: #fffefa;
+      --panel-2: #ebe7dc;
+      --ink: #171713;
+      --muted: #686457;
+      --line: #d8d0bd;
+      --accent: #0f766e;
+      --accent-2: #b42318;
+      --shadow: 0 1px 2px rgba(23, 23, 19, .06), 0 14px 34px rgba(23, 23, 19, .08);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #151511;
+        --panel: #1e1e19;
+        --panel-2: #29271f;
+        --ink: #f2efe4;
+        --muted: #aaa28c;
+        --line: #3d382b;
+        --accent: #2dd4bf;
+        --accent-2: #fb7185;
+        --shadow: 0 1px 2px rgba(0, 0, 0, .28), 0 16px 42px rgba(0, 0, 0, .3);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(90deg, rgba(127,127,127,.04) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(127,127,127,.04) 1px, transparent 1px),
+        var(--bg);
+      background-size: 28px 28px;
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    button, input, select {
+      font: inherit;
+      color: inherit;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(140px, 220px) 86px 110px;
+      gap: 8px;
+      align-items: center;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+
+    .search, .select, .stepper, .toggle {
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--panel);
+      box-shadow: 0 1px 0 rgba(255,255,255,.2) inset;
+    }
+
+    .search {
+      padding: 0 12px;
+      min-width: 0;
+      outline: none;
+    }
+
+    .search:focus, .select:focus, .stepper:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+    }
+
+    .search:disabled, .select:disabled, .stepper:disabled, .toggle button:disabled {
+      cursor: wait;
+      opacity: .66;
+    }
+
+    .select, .stepper {
+      padding: 0 10px;
+      min-width: 0;
+    }
+
+    .toggle {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      padding: 3px;
+      gap: 3px;
+    }
+
+    .toggle button {
+      border: 0;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    .toggle button.active {
+      background: var(--accent);
+      color: color-mix(in srgb, var(--panel) 94%, white);
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(280px, 40%) minmax(0, 1fr);
+      gap: 12px;
+      padding: 12px;
+      min-height: 0;
+    }
+
+    .pane {
+      min-width: 0;
+      min-height: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .results {
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .pane-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .count {
+      font-family: var(--mono);
+      color: var(--ink);
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    .result-list {
+      overflow: auto;
+      padding: 8px;
+      min-height: 0;
+    }
+
+    .result {
+      width: 100%;
+      display: grid;
+      gap: 6px;
+      padding: 10px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .result:hover, .result.active {
+      border-color: var(--line);
+      background: var(--panel-2);
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .path {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .score {
+      flex: 0 0 auto;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .heading, .snippet {
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      line-height: 1.42;
+    }
+
+    .heading {
+      font-size: 12px;
+    }
+
+    .snippet {
+      display: -webkit-box;
+      -webkit-line-clamp: 4;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .viewer {
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .doc-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: var(--mono);
+      color: var(--ink);
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    .doc-body {
+      margin: 0;
+      padding: 18px;
+      overflow: auto;
+      min-height: 0;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.55;
+      tab-size: 2;
+    }
+
+    .doc-line {
+      display: grid;
+      grid-template-columns: 5ch minmax(0, 1fr);
+      gap: 12px;
+      min-height: 1.55em;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .line-no {
+      user-select: none;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .line-text {
+      min-width: 0;
+    }
+
+    .empty, .error {
+      padding: 24px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .error {
+      color: var(--accent-2);
+    }
+
+    .mark-line {
+      margin: 0 -8px;
+      padding: 0 8px;
+      background: color-mix(in srgb, var(--accent) 18%, transparent);
+      border-left: 3px solid var(--accent);
+    }
+
+    @media (max-width: 760px) {
+      .topbar {
+        grid-template-columns: 1fr 92px;
+      }
+      .select {
+        grid-column: 1 / -1;
+        order: 3;
+      }
+      .toggle {
+        order: 2;
+      }
+      .stepper {
+        order: 4;
+      }
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+      .pane {
+        min-height: 40vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <form class="topbar" id="search-form">
+      <input class="search" id="query" name="q" autocomplete="off" spellcheck="false" placeholder="Search">
+      <select class="select" id="source" name="source"></select>
+      <input class="stepper" id="top-k" name="top_k" type="number" min="1" max="50" value="10" aria-label="Top K">
+      <div class="toggle" role="group" aria-label="Output mode">
+        <button type="button" id="mode-chunks" class="active">Chunks</button>
+        <button type="button" id="mode-files">Files</button>
+      </div>
+    </form>
+
+    <section class="workspace">
+      <aside class="pane results">
+        <div class="pane-head">
+          <span>Results</span>
+          <span class="count" id="count">0</span>
+        </div>
+        <div class="result-list" id="results">
+          <div class="empty">No query.</div>
+        </div>
+      </aside>
+
+      <section class="pane viewer">
+        <div class="pane-head">
+          <span class="doc-title" id="doc-title">Document</span>
+          <span class="count" id="doc-state"></span>
+        </div>
+        <div class="doc-body" id="doc-body">Select a result.</div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      sources: [],
+      hits: [],
+      output: "chunks",
+      activeKey: null,
+      abort: null,
+      lastSearchMs: null,
+      isSearching: false,
+      suppressUrl: false
+    };
+
+    const els = {
+      form: document.getElementById("search-form"),
+      query: document.getElementById("query"),
+      source: document.getElementById("source"),
+      topK: document.getElementById("top-k"),
+      chunks: document.getElementById("mode-chunks"),
+      files: document.getElementById("mode-files"),
+      results: document.getElementById("results"),
+      count: document.getElementById("count"),
+      title: document.getElementById("doc-title"),
+      docState: document.getElementById("doc-state"),
+      body: document.getElementById("doc-body")
+    };
+
+    function text(value) {
+      return value == null ? "" : String(value);
+    }
+
+    function setError(message) {
+      els.results.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
+      els.count.textContent = "0";
+      setSearching(false);
+    }
+
+    function escapeHtml(value) {
+      return text(value).replace(/[&<>"']/g, ch => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+
+    function setMode(mode, options = {}) {
+      state.output = mode;
+      els.chunks.classList.toggle("active", mode === "chunks");
+      els.files.classList.toggle("active", mode === "files");
+      if (options.search !== false && els.query.value.trim()) search({ pushUrl: true });
+    }
+
+    function setSearching(on) {
+      state.isSearching = on;
+      els.query.disabled = on;
+      els.source.disabled = on;
+      els.topK.disabled = on;
+      els.chunks.disabled = on;
+      els.files.disabled = on;
+      els.count.textContent = on ? "..." : els.count.textContent;
+    }
+
+    function applyUrlState() {
+      const params = new URLSearchParams(window.location.search);
+      const q = params.get("q") || "";
+      const source = params.get("source") || "";
+      const topK = params.get("top_k") || params.get("topk") || "";
+      const output = params.get("output") || "";
+      state.suppressUrl = true;
+      els.query.value = q;
+      if (topK) els.topK.value = topK;
+      if (source) els.source.value = source;
+      if (output === "files" || output === "chunks") setMode(output, { search: false });
+      state.suppressUrl = false;
+      if (q.trim()) search({ pushUrl: false });
+    }
+
+    function syncUrl() {
+      if (state.suppressUrl) return;
+      const params = new URLSearchParams();
+      const q = els.query.value.trim();
+      if (q) params.set("q", q);
+      if (els.source.value) params.set("source", els.source.value);
+      if (els.topK.value && els.topK.value !== "10") params.set("top_k", els.topK.value);
+      if (state.output !== "chunks") params.set("output", state.output);
+      const next = params.toString() ? `${window.location.pathname}?${params}` : window.location.pathname;
+      window.history.pushState(null, "", next);
+    }
+
+    async function loadSources() {
+      const res = await fetch("/api/sources");
+      if (!res.ok) throw new Error(await errorText(res));
+      state.sources = await res.json();
+      els.source.innerHTML = `<option value="">All sources</option>` +
+        state.sources.map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join("");
+    }
+
+    async function errorText(res) {
+      try {
+        const body = await res.json();
+        return body.error || res.statusText;
+      } catch (_) {
+        return res.statusText;
+      }
+    }
+
+    async function search(options = {}) {
+      const pushUrl = options.pushUrl !== false;
+      const q = els.query.value.trim();
+      if (!q) {
+        state.hits = [];
+        els.results.innerHTML = `<div class="empty">Press Enter to search.</div>`;
+        els.count.textContent = "0";
+        if (pushUrl) syncUrl();
+        return;
+      }
+      if (state.abort) state.abort.abort();
+      const controller = new AbortController();
+      state.abort = controller;
+      const started = performance.now();
+      setSearching(true);
+      els.results.innerHTML = `<div class="empty">Searching...</div>`;
+      const params = new URLSearchParams({
+        q,
+        top_k: String(els.topK.value || 10),
+        output: state.output
+      });
+      if (els.source.value) params.set("source", els.source.value);
+      try {
+        const res = await fetch(`/api/search?${params}`, { signal: controller.signal });
+        if (!res.ok) throw new Error(await errorText(res));
+        state.hits = await res.json();
+        state.lastSearchMs = Math.max(1, Math.round(performance.now() - started));
+        if (pushUrl) syncUrl();
+        renderResults();
+      } catch (err) {
+        if (err.name !== "AbortError") setError(err.message);
+      } finally {
+        if (state.abort === controller) {
+          setSearching(false);
+        }
+      }
+    }
+
+    function hitKey(hit) {
+      return `${hit.source}:${hit.path}:${hit.line}:${hit.chunk_id}`;
+    }
+
+    function renderResults() {
+      els.count.textContent = state.lastSearchMs == null
+        ? String(state.hits.length)
+        : `${state.hits.length} · ${state.lastSearchMs}ms`;
+      if (!state.hits.length) {
+        els.results.innerHTML = `<div class="empty">No matches.</div>`;
+        return;
+      }
+      els.results.innerHTML = state.hits.map(hit => {
+        const key = hitKey(hit);
+        const loc = hit.line ? `${hit.path}:${hit.line}` : hit.path;
+        return `
+          <button class="result ${key === state.activeKey ? "active" : ""}" data-key="${escapeHtml(key)}">
+            <div class="meta">
+              <span class="path">${escapeHtml(hit.source)} / ${escapeHtml(loc)}</span>
+              <span class="score">${Number(hit.score || 0).toFixed(3)}</span>
+            </div>
+            ${hit.heading_path ? `<div class="heading">${escapeHtml(hit.heading_path)}</div>` : ""}
+            ${hit.snippet ? `<div class="snippet">${escapeHtml(hit.snippet)}</div>` : ""}
+          </button>`;
+      }).join("");
+    }
+
+    async function openHit(hit) {
+      state.activeKey = hitKey(hit);
+      renderResults();
+      els.title.textContent = `${hit.source} / ${hit.path}`;
+      els.docState.textContent = "";
+      els.body.textContent = "Loading...";
+      const params = new URLSearchParams({ source: hit.source, path: hit.path });
+      try {
+        const res = await fetch(`/api/doc?${params}`);
+        if (!res.ok) throw new Error(await errorText(res));
+        const doc = await res.json();
+        renderDoc(doc, hit.line || 1);
+      } catch (err) {
+        els.body.innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
+      }
+    }
+
+    function renderDoc(doc, line) {
+      els.docState.textContent = doc.truncated ? "truncated" : `${doc.byte_count} bytes`;
+      const lines = text(doc.content).split("\n");
+      els.body.innerHTML = lines.map((raw, idx) => {
+        const n = idx + 1;
+        const html = escapeHtml(raw || " ");
+        const marked = n === line ? " mark-line" : "";
+        const id = n === line ? ` id="hit-line"` : "";
+        return `<div class="doc-line${marked}"${id}><span class="line-no">${n}</span><span class="line-text">${html}</span></div>`;
+      }).join("\n");
+      const mark = document.getElementById("hit-line");
+      if (mark) mark.scrollIntoView({ block: "center" });
+    }
+
+    els.form.addEventListener("submit", event => {
+      event.preventDefault();
+      search({ pushUrl: true });
+    });
+    els.query.addEventListener("keydown", event => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        search({ pushUrl: true });
+      }
+    });
+    els.source.addEventListener("change", () => search({ pushUrl: true }));
+    els.topK.addEventListener("change", () => search({ pushUrl: true }));
+    els.chunks.addEventListener("click", () => setMode("chunks"));
+    els.files.addEventListener("click", () => setMode("files"));
+    els.results.addEventListener("click", event => {
+      const button = event.target.closest(".result");
+      if (!button) return;
+      const hit = state.hits.find(h => hitKey(h) === button.dataset.key);
+      if (hit) openHit(hit);
+    });
+
+    window.addEventListener("popstate", () => applyUrlState());
+
+    loadSources()
+      .then(() => {
+        applyUrlState();
+        if (!els.query.value.trim()) {
+          els.results.innerHTML = `<div class="empty">Press Enter to search.</div>`;
+        }
+      })
+      .catch(err => setError(err.message));
+  </script>
+</body>
+</html>

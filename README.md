@@ -213,6 +213,12 @@ When the daemon's alive, **`dora install`** auto-detects it and writes
 `{"url": "http://127.0.0.1:8181/mcp"}` into each MCP client's config instead of
 the stdio launch command — clients connect over HTTP and share the loaded models.
 
+The same daemon also serves a read-only local web UI at
+`http://127.0.0.1:8181/`: search registered sources, skim ranked results, and
+open full documents in the browser. It has no npm build, no CDN, and no write
+endpoints. Start with `dora mcp --http --no-web` if you only want the MCP
+transport.
+
 If you shut the daemon down later, re-run `dora install` to flip clients back to
 stdio. `dora doctor` shows the daemon's state under MCP DAEMON.
 

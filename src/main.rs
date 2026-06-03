@@ -143,6 +143,10 @@ enum Command {
         #[arg(long)]
         daemon: bool,
 
+        /// Disable the local read-only web UI normally served with --http.
+        #[arg(long)]
+        no_web: bool,
+
         /// Subcommand action — `stop` SIGTERMs a running daemon, `status` reports state.
         /// When absent and no --http flag, runs stdio (the v0–v0.4 default).
         #[command(subcommand)]
@@ -355,6 +359,7 @@ fn main() -> Result<()> {
             bind,
             port,
             daemon,
+            no_web,
             action,
         }) => cmd_mcp(McpOptions {
             source,
@@ -364,6 +369,7 @@ fn main() -> Result<()> {
             bind,
             port,
             daemon,
+            web: !no_web,
             action,
         }),
         Some(Command::Source { action }) => cmd_source(action),
@@ -441,6 +447,7 @@ struct McpOptions {
     bind: String,
     port: u16,
     daemon: bool,
+    web: bool,
     action: Option<McpAction>,
 }
 
@@ -509,7 +516,10 @@ fn cmd_mcp(opts: McpOptions) -> Result<()> {
                  is searchable by anyone reaching this address."
             );
         }
-        mcp::Transport::Http { bind: addr }
+        mcp::Transport::Http {
+            bind: addr,
+            web: opts.web,
+        }
     } else {
         mcp::Transport::Stdio
     };

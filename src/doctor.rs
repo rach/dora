@@ -147,6 +147,12 @@ fn check_mcp_daemon() -> Vec<Check> {
                     human_uptime(uptime)
                 ),
             });
+            out.push(Check {
+                status: CheckStatus::Info,
+                label: "web UI".into(),
+                detail: "http://127.0.0.1:8181/ (enabled unless daemon was started with --no-web)"
+                    .to_string(),
+            });
         }
         Err(_) => {
             out.push(Check {

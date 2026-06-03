@@ -13,6 +13,9 @@ All notable changes to dora are documented here. Format roughly follows
 - Added debug-only `dora eval --compare-disable-graph`, which runs a fixture with
   graph-on and graph-off and fails unless graph-on improves R@5 and MRR.
 - Added GitHub Actions CI for the committed dora eval gate.
+- Added a read-only local web UI on `dora mcp --http` for searching sources and
+  opening documents in the browser.
+- Added `dora mcp --http --no-web` to run only the MCP HTTP transport.
 
 ### Changed
 
