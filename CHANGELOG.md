@@ -12,6 +12,7 @@ All notable changes to dora are documented here. Format roughly follows
   associative queries for graph-PPR evaluation.
 - Added debug-only `dora eval --compare-disable-graph`, which runs a fixture with
   graph-on and graph-off and fails unless graph-on improves R@5 and MRR.
+- Added GitHub Actions CI for the committed dora eval gate.
 
 ### Changed
 

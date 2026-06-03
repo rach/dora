@@ -568,6 +568,12 @@ Historical qmd/private-fixture numbers in the changelog are context only. The
 committed gate is dora-only so contributors can run it without qmd, ollama, or
 private eval data.
 
+### CI
+
+CI runs `scripts/eval.sh` on GitHub Actions. Releases stay manual for now via the
+local `scripts/release.sh` flow, because publishing also updates the separate
+Homebrew tap and that requires carefully scoped cross-repo credentials.
+
 ### `dora source <add|list|remove|describe>`
 
 Manages the global registry at `~/.config/dora/registry.toml`. Folders here become searchable from a single `dora mcp` server.
