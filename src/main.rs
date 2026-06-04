@@ -910,32 +910,32 @@ fn cmd_calibrate(name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Calibrate one source: sample positive queries (from its own chunk headings) and negative
-/// queries (other sources' headings + the generic-introspective set), measure the top-ANN
-/// cosine distribution of each, and pick a floor that keeps ~90% of positives above it. Writes
-/// `[confidence] ann_floor` to the source's config.
-fn calibrate_one(src: &registry::Source, reg: &registry::Registry) -> Result<()> {
-    let root = src.path.canonicalize().unwrap_or_else(|_| src.path.clone());
-    migrate_source_if_legacy(&src.name, &root)?;
-    let cfg =
-        Config::load_or_default(&root, &paths::config_path(&src.name)?).context("load config")?;
-    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
-    let db = paths::db_path(&src.name)?;
-    if !db.exists() {
-        bail!(
-            "source '{}' isn't indexed yet — run `dora index` first",
-            src.name
-        );
-    }
-    let store = Store::open(&db, embedder.dims())?;
+struct CalibrationResult {
+    floor: f32,
+    pos_n: usize,
+    neg_n: usize,
+    pos_median: f32,
+    neg_median: f32,
+}
 
-    // Sample up to ~40 chunks evenly across the index for positive queries.
+/// Derive a confidence floor for `name` from an already-open index: sample positive queries
+/// (this source's headings/symbols) and negatives (other sources' headings + the generic-
+/// introspective set), measure each query's top-ANN cosine, and pick a floor. Pure compute —
+/// the caller decides whether to persist it. Shared by `dora calibrate` and the first-index
+/// auto-calibration in `cmd_index`.
+fn compute_calibrated_floor(
+    name: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    reg: &registry::Registry,
+) -> Result<CalibrationResult> {
     let all_chunks = store.all_chunks_for_graph()?;
     if all_chunks.is_empty() {
-        bail!("source '{}' has no chunks", src.name);
+        bail!("source '{name}' has no chunks");
     }
     let sample_n = 40usize.min(all_chunks.len());
     let stride = (all_chunks.len() / sample_n).max(1);
+    let dims = embedder.dims();
 
     let top_ann_cosine = |query: &str| -> Option<f32> {
         let qv = embedder.embed_one(query).ok()?;
@@ -963,17 +963,17 @@ fn calibrate_one(src: &registry::Source, reg: &registry::Registry) -> Result<()>
         }
     }
 
-    // Negatives: headings sampled from OTHER sources + the generic set.
+    // Negatives: the generic-introspective set, plus headings sampled from OTHER sources. A
+    // lone/first source naturally falls back to just the generic set.
     let mut neg_queries: Vec<String> = CALIBRATION_NEGATIVES
         .iter()
         .map(|s| s.to_string())
         .collect();
     for other in &reg.sources {
-        if other.name == src.name {
+        if other.name == name {
             continue;
         }
-        let Ok(ostore) = paths::db_path(&other.name).and_then(|p| Store::open(&p, embedder.dims()))
-        else {
+        let Ok(ostore) = paths::db_path(&other.name).and_then(|p| Store::open(&p, dims)) else {
             continue;
         };
         let Ok(chunks) = ostore.all_chunks_for_graph() else {
@@ -1002,23 +1002,45 @@ fn calibrate_one(src: &registry::Source, reg: &registry::Registry) -> Result<()>
         }
     }
 
-    let floor = choose_floor(&pos, &neg);
+    Ok(CalibrationResult {
+        floor: choose_floor(&pos, &neg),
+        pos_n: pos.len(),
+        neg_n: neg.len(),
+        pos_median: median(&pos),
+        neg_median: median(&neg),
+    })
+}
+
+/// `dora calibrate` for one source: open its index, compute the floor, persist it, print stats.
+fn calibrate_one(src: &registry::Source, reg: &registry::Registry) -> Result<()> {
+    let root = src.path.canonicalize().unwrap_or_else(|_| src.path.clone());
+    migrate_source_if_legacy(&src.name, &root)?;
+    let cfg =
+        Config::load_or_default(&root, &paths::config_path(&src.name)?).context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
+    let db = paths::db_path(&src.name)?;
+    if !db.exists() {
+        bail!(
+            "source '{}' isn't indexed yet — run `dora index` first",
+            src.name
+        );
+    }
+    let store = Store::open(&db, embedder.dims())?;
+    let r = compute_calibrated_floor(&src.name, &store, embedder.as_ref(), reg)?;
     write_config_value(
         &paths::config_path(&src.name)?,
         "confidence",
         "ann_floor",
-        &format!("{floor:.3}"),
+        &format!("{:.3}", r.floor),
     )?;
-    let pos_med = median(&pos);
-    let neg_med = median(&neg);
     println!(
         "{}: ann_floor = {:.3}  (positives n={} median={:.3}, negatives n={} median={:.3}, embedder={})",
         src.name,
-        floor,
-        pos.len(),
-        pos_med,
-        neg.len(),
-        neg_med,
+        r.floor,
+        r.pos_n,
+        r.pos_median,
+        r.neg_n,
+        r.neg_median,
         cfg.embedder.model,
     );
     Ok(())
@@ -1339,6 +1361,32 @@ fn cmd_index(vault: &Path, dry_run: bool) -> Result<()> {
         started.elapsed(),
         embedder.id(),
     );
+
+    // First-index auto-calibration: if this source has no confidence floor yet, derive one now
+    // from the freshly-built index so the low-confidence signal works out of the box. The
+    // marginal cost (~tens of query embeds) is noise next to embedding the corpus. Skipped on
+    // dry-run, on empty indexes, and once a floor exists — re-run later with `dora calibrate`.
+    if !dry_run && summary.inserted + summary.updated > 0 && cfg.confidence.ann_floor.is_none() {
+        let reg = registry::Registry::load().unwrap_or_default();
+        match compute_calibrated_floor(&name, &store, embedder.as_ref(), &reg) {
+            Ok(r) => {
+                if write_config_value(
+                    &paths::config_path(&name)?,
+                    "confidence",
+                    "ann_floor",
+                    &format!("{:.3}", r.floor),
+                )
+                .is_ok()
+                {
+                    eprintln!(
+                        "calibrated: ann_floor = {:.3} (positives n={}, negatives n={}) — re-run `dora calibrate {name}` anytime",
+                        r.floor, r.pos_n, r.neg_n
+                    );
+                }
+            }
+            Err(e) => eprintln!("confidence calibration skipped: {e}"),
+        }
+    }
     Ok(())
 }
 

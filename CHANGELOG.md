@@ -15,6 +15,10 @@ All notable changes to dora are documented here. Format roughly follows
   file-level cross-arm agreement, and a literal/exact-match override) — NOT the
   uncalibrated RRF score. Lets agents and users tell a real answer from a "generic
   attractor" the index surfaces when the vault has nothing relevant.
+- **Auto-calibration on first index.** When a source has no confidence floor yet, `dora
+  index` derives one automatically from the freshly-built index, so the signal is
+  calibrated out of the box with no extra step (skipped on dry-run and on incremental
+  re-indexes; re-run anytime with `dora calibrate`).
 - `dora calibrate [<name>]` derives a per-source `[confidence] ann_floor` from the
   source's own index (sampling positive queries from its headings/symbols and negatives
   from other sources + generic prompts), so the floor fits your corpus + embedder instead
