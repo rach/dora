@@ -49,6 +49,44 @@ pub struct HitSignals {
     pub final_score: f64,
 }
 
+/// Fallback ANN-cosine floor when a source hasn't been calibrated and no per-embedder
+/// default applies. Provisional — `dora calibrate` derives a real per-(embedder, mode)
+/// floor from the source's own index. See `config::ConfidenceConfig`.
+pub const DEFAULT_ANN_FLOOR: f32 = 0.45;
+
+/// Result-set-level confidence in whether the vault actually contains a good answer.
+/// Metadata only — never affects ranking. Computed from raw arm evidence (top ANN cosine,
+/// cross-arm agreement, literal support) rather than the uncalibrated RRF score.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultConfidence {
+    /// 0–1 overall confidence (1.0 when an exact/literal hit backs the top result).
+    pub score: f32,
+    /// True when the top result looks like a generic attractor, not a real answer.
+    pub low_confidence: bool,
+    /// Cosine of the query against the #1 ANN hit's embedding (None if no ANN hit).
+    pub top_ann_similarity: Option<f32>,
+    /// The floor used for the gate (resolved per source / per embedder).
+    pub ann_floor: f32,
+    /// Same *file* tops both the lexical and vector arms (the reliability signal).
+    pub file_agreement: bool,
+    /// Same *chunk* tops both arms (diagnostic; stricter than the gate uses).
+    pub chunk_agreement: bool,
+    /// The final #1 hit had literal/exact-substring support (confidence override).
+    pub strong_literal: bool,
+    /// Fused top1−top2 score gap (diagnostic only; not gated).
+    pub top1_top2_margin: Option<f64>,
+}
+
+/// Envelope returned by `search_with_confidence`: the ranked hits plus the result-set
+/// confidence. `search()` remains the thin `Vec<Hit>` entry point for callers that don't
+/// need confidence (eval, etc.).
+#[derive(Debug, Serialize)]
+pub struct SearchResultSet {
+    pub low_confidence: bool,
+    pub confidence: ResultConfidence,
+    pub hits: Vec<Hit>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Hit {
     /// Stable id of the chunk in this source's index. Exposed so the MCP layer (or agents
@@ -64,6 +102,9 @@ pub struct Hit {
     pub score: f64,
     pub heading_path: String,
     pub snippet: String,
+    /// Per-hit semantic confidence: this hit's cosine against the query, clamped to [0,1].
+    /// Lets agents down-rank weak hits within a result set. Metadata only.
+    pub confidence: f32,
     /// Optional user-defined context for this path's subtree, set via `dora context add`.
     /// Surfaces to agents so e.g. `/api` hits can carry "REST API reference" while `/sdk`
     /// hits carry "TypeScript SDK reference" — qmd parity.
@@ -96,6 +137,9 @@ pub struct SearchOptions<'a> {
     pub not_queries: Vec<String>,
     /// Populate per-hit retrieval signals for JSON/explain/eval flows.
     pub diagnostics: bool,
+    /// ANN-cosine floor for the low-confidence gate, resolved by the caller from config
+    /// (per-source value → per-embedder default → `DEFAULT_ANN_FLOOR`).
+    pub ann_floor: f32,
 }
 
 impl<'a> Default for SearchOptions<'a> {
@@ -109,6 +153,7 @@ impl<'a> Default for SearchOptions<'a> {
             and_queries: Vec::new(),
             not_queries: Vec::new(),
             diagnostics: false,
+            ann_floor: DEFAULT_ANN_FLOOR,
         }
     }
 }
@@ -129,6 +174,7 @@ pub struct ExplainReport {
     pub fts_query: String,
     pub prf_terms: Vec<String>,
     pub arms: ExplainArms,
+    pub confidence: ResultConfidence,
     pub hits: Vec<Hit>,
 }
 
@@ -150,15 +196,17 @@ pub struct ArmHit {
     pub snippet: String,
 }
 
-pub fn search(
+/// Full search entry point: ranked hits + result-set confidence. Logs usage (best-effort).
+pub fn search_with_confidence(
     query: &str,
     store: &Store,
     embedder: &dyn Embedder,
     source_root: &Path,
     source_name: &str,
     opts: SearchOptions<'_>,
-) -> Result<Vec<Hit>> {
-    let (hits, query_vec) = run_search(query, store, embedder, source_root, source_name, opts)?;
+) -> Result<SearchResultSet> {
+    let (hits, query_vec, confidence) =
+        run_search(query, store, embedder, source_root, source_name, opts)?;
 
     // Best-effort usage logging. The MCP layer's ring buffer + `mark_used_by_query` patches
     // `used_chunk_id` if a follow-up `multi_get` reads one of the returned paths within 60s.
@@ -169,7 +217,23 @@ pub fn search(
         eprintln!("dora: usage logging failed (continuing): {err}");
     }
 
-    Ok(hits)
+    Ok(SearchResultSet {
+        low_confidence: confidence.low_confidence,
+        confidence,
+        hits,
+    })
+}
+
+/// Thin `Vec<Hit>` entry point for callers that don't need confidence (eval, etc.).
+pub fn search(
+    query: &str,
+    store: &Store,
+    embedder: &dyn Embedder,
+    source_root: &Path,
+    source_name: &str,
+    opts: SearchOptions<'_>,
+) -> Result<Vec<Hit>> {
+    Ok(search_with_confidence(query, store, embedder, source_root, source_name, opts)?.hits)
 }
 
 pub fn explain(
@@ -190,7 +254,7 @@ pub fn explain(
         literal: arm_hits(&detailed.literal, store, source_root)?,
         prf: arm_hits(&detailed.prf, store, source_root)?,
     };
-    let (hits, _query_vec) = run_search_from_detailed(
+    let (hits, _query_vec, confidence) = run_search_from_detailed(
         query,
         store,
         embedder,
@@ -204,6 +268,7 @@ pub fn explain(
         fts_query,
         prf_terms,
         arms,
+        confidence,
         hits,
     })
 }
@@ -215,7 +280,7 @@ fn run_search(
     source_root: &Path,
     source_name: &str,
     opts: SearchOptions<'_>,
-) -> Result<(Vec<Hit>, Vec<f32>)> {
+) -> Result<(Vec<Hit>, Vec<f32>, ResultConfidence)> {
     // Primary hybrid pass: 4-arm RRF over the user's query. `query_vec` is kept for
     // usage logging downstream.
     let detailed = compute_merged_detailed(query, store, embedder, opts.path_prefix)?;
@@ -238,7 +303,7 @@ fn run_search_from_detailed(
     source_name: &str,
     opts: SearchOptions<'_>,
     detailed: MergedDetails,
-) -> Result<(Vec<Hit>, Vec<f32>)> {
+) -> Result<(Vec<Hit>, Vec<f32>, ResultConfidence)> {
     let mut merged = detailed.merged.clone();
     let query_vec = detailed.query_vec.clone();
     let rank_signals = if opts.diagnostics {
@@ -300,6 +365,10 @@ fn run_search_from_detailed(
         merged.into_iter().take(opts.top_k).collect()
     };
 
+    // Result-set confidence, computed from the raw arm evidence (top ANN cosine, cross-arm
+    // agreement, literal support) — NOT the RRF score. Metadata only; never reorders hits.
+    let confidence = compute_confidence(&detailed, &merged, store, &query_vec, opts.ann_floor);
+
     let mut hits = hits_from_ranked(
         &merged,
         store,
@@ -307,6 +376,7 @@ fn run_search_from_detailed(
         source_name,
         rank_signals.as_ref(),
         &graph_boosts,
+        &query_vec,
     )?;
 
     // Files-mode: collapse already deduplicates by file, so we can just strip the
@@ -320,7 +390,93 @@ fn run_search_from_detailed(
         }
     }
 
-    Ok((hits, query_vec))
+    Ok((hits, query_vec, confidence))
+}
+
+/// Compute result-set confidence from raw arm evidence. Pure-ish (does a few read-only
+/// store lookups for embeddings + chunk paths); never mutates ranking.
+fn compute_confidence(
+    detailed: &MergedDetails,
+    final_ranked: &[(i64, f64)],
+    store: &Store,
+    query_vec: &[f32],
+    ann_floor: f32,
+) -> ResultConfidence {
+    // Top ANN cosine, computed directly (vec0 uses L2 and embeddings aren't guaranteed
+    // normalized, so we cannot derive cosine from the stored distance — compute it).
+    let top_ann_similarity = detailed.ann.first().and_then(|&cid| {
+        store
+            .fetch_chunk_embedding(cid)
+            .ok()
+            .flatten()
+            .map(|emb| crate::graph::cosine(query_vec, &emb))
+    });
+
+    let path_of =
+        |cid: i64| -> Option<String> { store.fetch_chunk(cid).ok().flatten().map(|c| c.path) };
+    let fts_top = detailed.fts.first().copied();
+    let ann_top = detailed.ann.first().copied();
+    let file_agreement = match (fts_top, ann_top) {
+        (Some(a), Some(b)) => match (path_of(a), path_of(b)) {
+            (Some(pa), Some(pb)) => pa == pb,
+            _ => false,
+        },
+        _ => false,
+    };
+    let chunk_agreement = matches!((fts_top, ann_top), (Some(a), Some(b)) if a == b);
+
+    // Literal/exact evidence backing the final #1 hit → confidence override (protects
+    // identifier / symbol searches that legitimately have low cosine).
+    let strong_literal = final_ranked
+        .first()
+        .map(|(id, _)| detailed.literal.contains(id))
+        .unwrap_or(false);
+
+    let top1_top2_margin = if final_ranked.len() >= 2 {
+        Some(final_ranked[0].1 - final_ranked[1].1)
+    } else {
+        None
+    };
+
+    let (low_confidence, score) = confidence_decision(
+        top_ann_similarity,
+        file_agreement,
+        strong_literal,
+        ann_floor,
+    );
+
+    ResultConfidence {
+        score,
+        low_confidence,
+        top_ann_similarity,
+        ann_floor,
+        file_agreement,
+        chunk_agreement,
+        strong_literal,
+        top1_top2_margin,
+    }
+}
+
+/// The pure low-confidence gate + score, factored out for testing. A result is low-confidence
+/// only when there's no exact/literal evidence, the top semantic match is below the floor, AND
+/// the lexical/vector arms disagree on the top file. The literal override protects identifier
+/// and symbol searches that legitimately have low cosine.
+fn confidence_decision(
+    top_ann_similarity: Option<f32>,
+    file_agreement: bool,
+    strong_literal: bool,
+    ann_floor: f32,
+) -> (bool, f32) {
+    let sim = top_ann_similarity.unwrap_or(0.0);
+    let low_confidence = !strong_literal && sim < ann_floor && !file_agreement;
+    let score = if strong_literal {
+        1.0
+    } else if file_agreement {
+        sim.clamp(0.0, 1.0).max(0.6)
+    } else {
+        sim.clamp(0.0, 1.0)
+    };
+    (low_confidence, score)
 }
 
 struct RankSignals {
@@ -355,12 +511,21 @@ fn hits_from_ranked(
     source_name: &str,
     rank_signals: Option<&RankSignals>,
     graph_boosts: &HashMap<i64, f64>,
+    query_vec: &[f32],
 ) -> Result<Vec<Hit>> {
     let mut hits = Vec::with_capacity(ranked.len());
     for (chunk_id, score) in ranked.iter().copied() {
         if let Some(chunk) = store.fetch_chunk(chunk_id)? {
             let line = line_for_byte(source_root, Path::new(&chunk.path), chunk.start_byte);
             let context = store.context_for(&chunk.path).ok().flatten();
+            // Per-hit semantic confidence: this hit's own cosine to the query, clamped to
+            // [0,1]. Read-only; doesn't affect ordering.
+            let confidence = store
+                .fetch_chunk_embedding(chunk_id)
+                .ok()
+                .flatten()
+                .map(|emb| crate::graph::cosine(query_vec, &emb).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
             let signals = rank_signals.map(|ranks| HitSignals {
                 fts_rank: ranks.fts.get(&chunk_id).copied(),
                 ann_rank: ranks.ann.get(&chunk_id).copied(),
@@ -377,6 +542,7 @@ fn hits_from_ranked(
                 score,
                 heading_path: chunk.heading_path,
                 snippet: snippet_from(&chunk.content),
+                confidence,
                 context,
                 signals,
             });
@@ -708,9 +874,44 @@ fn rrf_merge_weighted(lists: &[(&[i64], f64)]) -> Vec<(i64, f64)> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{compute_prf_terms, rrf_merge_n};
+    use super::{compute_prf_terms, confidence_decision, rrf_merge_n};
     use crate::store::{init_sqlite_vec, ChunkRow, Store};
     use tempfile::tempdir;
+
+    #[test]
+    fn confidence_high_cosine_is_confident() {
+        let (low, score) = confidence_decision(Some(0.72), false, false, 0.45);
+        assert!(!low);
+        assert!((score - 0.72).abs() < 1e-6);
+    }
+
+    #[test]
+    fn confidence_low_cosine_no_agreement_is_low() {
+        let (low, _) = confidence_decision(Some(0.20), false, false, 0.45);
+        assert!(low);
+    }
+
+    #[test]
+    fn confidence_file_agreement_rescues_low_cosine() {
+        let (low, score) = confidence_decision(Some(0.20), true, false, 0.45);
+        assert!(!low, "file agreement should keep it confident");
+        assert!(score >= 0.6);
+    }
+
+    #[test]
+    fn confidence_literal_override_beats_low_cosine() {
+        // Identifier/symbol search: low cosine but exact literal evidence → confident.
+        let (low, score) = confidence_decision(Some(0.05), false, true, 0.45);
+        assert!(!low);
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn confidence_no_ann_hit_is_low() {
+        let (low, score) = confidence_decision(None, false, false, 0.45);
+        assert!(low);
+        assert_eq!(score, 0.0);
+    }
 
     /// PRF must surface vocabulary-adjacent terms from the corpus while filtering out
     /// stopwords and any token already in the user's query.

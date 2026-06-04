@@ -192,6 +192,13 @@ enum Command {
     /// Migrate pre-0.9 co-located `<source>/.dora/` indexes into the centralized
     /// `~/.dora/sources/<name>/` layout. Sweeps every registered source; idempotent.
     Migrate,
+    /// Derive a per-source confidence floor (`[confidence] ann_floor`) from the source's own
+    /// index, so the low-confidence signal is calibrated to your corpus + embedder rather than
+    /// a provisional default. Calibrates every registered source, or just `<name>`.
+    Calibrate {
+        /// Source name to calibrate. Omit to calibrate all registered sources.
+        name: Option<String>,
+    },
     /// Foreground file-watcher that keeps registered sources fresh. Runs until Ctrl-C.
     /// Same `--include` / `--exclude` semantics as `dora mcp`.
     Watch {
@@ -400,6 +407,7 @@ fn main() -> Result<()> {
         }) => cmd_install(client, include, exclude, !no_shell, wrap),
         Some(Command::Doctor) => cmd_doctor(),
         Some(Command::Migrate) => cmd_migrate(),
+        Some(Command::Calibrate { name }) => cmd_calibrate(name),
         Some(Command::Watch { include, exclude }) => cmd_watch(include, exclude),
         Some(Command::Wrappers { action }) => cmd_wrappers(action),
         Some(Command::Context { action }) => cmd_context(action),
@@ -870,6 +878,215 @@ fn cmd_migrate() -> Result<()> {
     Ok(())
 }
 
+/// Generic-introspective negative prompts: well-formed questions that have no specific home in
+/// a tactics/code corpus, so their top-ANN cosine should sit at the noise floor.
+const CALIBRATION_NEGATIVES: &[&str] = &[
+    "the most contrarian opinion I hold",
+    "something I changed my mind about",
+    "advice I would give my younger self",
+    "what is the meaning of life",
+    "my favorite childhood memory",
+    "how do I feel about the weather today",
+];
+
+fn cmd_calibrate(name: Option<String>) -> Result<()> {
+    let reg = registry::Registry::load().context("load registry")?;
+    if reg.sources.is_empty() {
+        println!("(no sources registered — nothing to calibrate)");
+        return Ok(());
+    }
+    let targets: Vec<registry::Source> = match &name {
+        Some(n) => vec![reg
+            .find_by_name(n)
+            .ok_or_else(|| anyhow::anyhow!("no source named '{n}'"))?
+            .clone()],
+        None => reg.sources.clone(),
+    };
+    for src in &targets {
+        if let Err(e) = calibrate_one(src, &reg) {
+            eprintln!("calibrate {} failed: {e}", src.name);
+        }
+    }
+    Ok(())
+}
+
+/// Calibrate one source: sample positive queries (from its own chunk headings) and negative
+/// queries (other sources' headings + the generic-introspective set), measure the top-ANN
+/// cosine distribution of each, and pick a floor that keeps ~90% of positives above it. Writes
+/// `[confidence] ann_floor` to the source's config.
+fn calibrate_one(src: &registry::Source, reg: &registry::Registry) -> Result<()> {
+    let root = src.path.canonicalize().unwrap_or_else(|_| src.path.clone());
+    migrate_source_if_legacy(&src.name, &root)?;
+    let cfg =
+        Config::load_or_default(&root, &paths::config_path(&src.name)?).context("load config")?;
+    let embedder: DynEmbedder = embed::from_config(&cfg.embedder, &paths::models_root()?)?;
+    let db = paths::db_path(&src.name)?;
+    if !db.exists() {
+        bail!(
+            "source '{}' isn't indexed yet — run `dora index` first",
+            src.name
+        );
+    }
+    let store = Store::open(&db, embedder.dims())?;
+
+    // Sample up to ~40 chunks evenly across the index for positive queries.
+    let all_chunks = store.all_chunks_for_graph()?;
+    if all_chunks.is_empty() {
+        bail!("source '{}' has no chunks", src.name);
+    }
+    let sample_n = 40usize.min(all_chunks.len());
+    let stride = (all_chunks.len() / sample_n).max(1);
+
+    let top_ann_cosine = |query: &str| -> Option<f32> {
+        let qv = embedder.embed_one(query).ok()?;
+        let ann = store.search_ann(&qv, 1, None).ok()?;
+        let cid = *ann.first()?;
+        let emb = store.fetch_chunk_embedding(cid).ok().flatten()?;
+        Some(crate::graph::cosine(&qv, &emb))
+    };
+
+    let mut pos: Vec<f32> = Vec::new();
+    for (i, (cid, _content)) in all_chunks.iter().enumerate() {
+        if i % stride != 0 {
+            continue;
+        }
+        if let Some(chunk) = store.fetch_chunk(*cid)? {
+            // Query = the last heading segment (a paraphrase-ish handle), falling back to the
+            // first few content words. Avoids feeding the chunk's exact text back in.
+            let q = positive_query(&chunk.heading_path, &chunk.content);
+            if q.trim().is_empty() {
+                continue;
+            }
+            if let Some(c) = top_ann_cosine(&q) {
+                pos.push(c);
+            }
+        }
+    }
+
+    // Negatives: headings sampled from OTHER sources + the generic set.
+    let mut neg_queries: Vec<String> = CALIBRATION_NEGATIVES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for other in &reg.sources {
+        if other.name == src.name {
+            continue;
+        }
+        let Ok(ostore) = paths::db_path(&other.name).and_then(|p| Store::open(&p, embedder.dims()))
+        else {
+            continue;
+        };
+        let Ok(chunks) = ostore.all_chunks_for_graph() else {
+            continue;
+        };
+        if chunks.is_empty() {
+            continue;
+        }
+        let st = (chunks.len() / 8).max(1);
+        for (i, (cid, _)) in chunks.iter().enumerate() {
+            if i % st != 0 {
+                continue;
+            }
+            if let Ok(Some(ch)) = ostore.fetch_chunk(*cid) {
+                let q = positive_query(&ch.heading_path, &ch.content);
+                if !q.trim().is_empty() {
+                    neg_queries.push(q);
+                }
+            }
+        }
+    }
+    let mut neg: Vec<f32> = Vec::new();
+    for q in &neg_queries {
+        if let Some(c) = top_ann_cosine(q) {
+            neg.push(c);
+        }
+    }
+
+    let floor = choose_floor(&pos, &neg);
+    write_config_value(
+        &paths::config_path(&src.name)?,
+        "confidence",
+        "ann_floor",
+        &format!("{floor:.3}"),
+    )?;
+    let pos_med = median(&pos);
+    let neg_med = median(&neg);
+    println!(
+        "{}: ann_floor = {:.3}  (positives n={} median={:.3}, negatives n={} median={:.3}, embedder={})",
+        src.name,
+        floor,
+        pos.len(),
+        pos_med,
+        neg.len(),
+        neg_med,
+        cfg.embedder.model,
+    );
+    Ok(())
+}
+
+/// Build a paraphrase-ish positive query from a chunk: prefer the last heading segment,
+/// else the first ~8 words of content.
+fn positive_query(heading_path: &str, content: &str) -> String {
+    let last_heading = heading_path
+        .rsplit(['>', '/'])
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty());
+    if let Some(h) = last_heading {
+        if h.len() >= 4 {
+            return h.to_string();
+        }
+    }
+    content
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Pick the low-confidence floor from the positive and negative top-cosine distributions.
+///
+/// The floor sits *just above* the negatives (the level where nonsense/other-corpus queries
+/// land) but is capped at the 10th percentile of positives so we never clip more than ~10% of
+/// real answers. This matters on code sources: positives synthesized from headings/symbols
+/// score high (code-vs-code), but real users ask in natural language, which scores lower — so
+/// a pure positives-percentile floor over-flags legitimate NL questions. Anchoring to the
+/// negatives keeps the floor low enough to pass those while still catching true attractors.
+/// We err toward NOT flagging: a missed weak query just loses a header; a false flag tells a
+/// user "no match" when there is one.
+fn choose_floor(pos: &[f32], neg: &[f32]) -> f32 {
+    if pos.is_empty() {
+        return search::DEFAULT_ANN_FLOOR;
+    }
+    let p10_pos = percentile(pos, 0.10);
+    let floor = if neg.is_empty() {
+        p10_pos
+    } else {
+        // Just above the bulk of negatives, but never above the positive p10.
+        (percentile(neg, 0.90) + 0.02).min(p10_pos)
+    };
+    floor.clamp(0.20, 0.70)
+}
+
+/// Linear-ish percentile of a slice of cosines (q in [0,1]). Empty → 0.
+fn percentile(v: &[f32], q: f32) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((s.len() as f32) * q).floor() as usize;
+    s[idx.min(s.len() - 1)]
+}
+
+fn median(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
 fn cmd_source(action: SourceAction) -> Result<()> {
     match action {
         SourceAction::Add {
@@ -1172,8 +1389,9 @@ fn cmd_search(cwd: &Path, query: &str, cli_opts: CliSearchOptions) -> Result<()>
         and_queries: cli_opts.and_queries,
         not_queries: cli_opts.not_queries,
         diagnostics: cli_opts.signals,
+        ann_floor: cfg.effective_ann_floor(),
     };
-    let hits = search_with_self_heal(
+    let result = search_with_self_heal(
         SearchRuntime {
             source_root: &source_root,
             source_name: &source_name,
@@ -1187,9 +1405,11 @@ fn cmd_search(cwd: &Path, query: &str, cli_opts: CliSearchOptions) -> Result<()>
     )?;
 
     if cli_opts.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        // Envelope: result-set confidence + hits. (v0.10 shape change — was a bare hit array.)
+        println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
+    let hits = result.hits;
     if hits.is_empty() {
         eprintln!("no hits");
         return Ok(());
@@ -1200,6 +1420,11 @@ fn cmd_search(cwd: &Path, query: &str, cli_opts: CliSearchOptions) -> Result<()>
             println!("{}", h.path);
         }
         return Ok(());
+    }
+    // Warn (to stderr, so it doesn't pollute piped stdout) when nothing scored as a strong
+    // match — the results below are best guesses, likely a generic attractor.
+    if result.low_confidence {
+        eprintln!("no strong match — closest guesses:");
     }
     let style = AnsiStyle::detect();
     for (i, h) in hits.iter().enumerate() {
@@ -1257,6 +1482,7 @@ fn cmd_explain(cwd: &Path, query: &str, top_k_override: Option<usize>, json: boo
         search::SearchOptions {
             top_k: top_k_override.unwrap_or(cfg.search.top_k),
             diagnostics: true,
+            ann_floor: cfg.effective_ann_floor(),
             ..Default::default()
         },
     )?;
@@ -1268,6 +1494,25 @@ fn cmd_explain(cwd: &Path, query: &str, top_k_override: Option<usize>, json: boo
 
     println!("query: {}", report.query);
     println!("fts: {}", report.fts_query);
+    let c = &report.confidence;
+    println!(
+        "confidence: {} (score {:.3})",
+        if c.low_confidence { "LOW" } else { "ok" },
+        c.score
+    );
+    println!(
+        "  top_ann_cosine={} floor={:.3} file_agreement={} chunk_agreement={} strong_literal={} margin={}",
+        c.top_ann_similarity
+            .map(|s| format!("{s:.3}"))
+            .unwrap_or_else(|| "none".into()),
+        c.ann_floor,
+        c.file_agreement,
+        c.chunk_agreement,
+        c.strong_literal,
+        c.top1_top2_margin
+            .map(|m| format!("{m:.4}"))
+            .unwrap_or_else(|| "n/a".into()),
+    );
     if report.prf_terms.is_empty() {
         println!("prf: (none)");
     } else {
@@ -1534,8 +1779,8 @@ pub(crate) struct SearchRuntime<'a> {
 pub(crate) fn search_with_self_heal(
     rt: SearchRuntime<'_>,
     query: &str,
-    opts: search::SearchOptions<'_>,
-) -> Result<Vec<search::Hit>> {
+    mut opts: search::SearchOptions<'_>,
+) -> Result<search::SearchResultSet> {
     let last_walk: u64 = rt
         .store
         .get_meta("last_walk_at")?
@@ -1551,7 +1796,10 @@ pub(crate) fn search_with_self_heal(
             false,
         )?;
     }
-    search::search(
+    // Resolve the confidence floor centrally from this source's config (calibrated value →
+    // per-embedder default) so both CLI and MCP get the correct per-source floor.
+    opts.ann_floor = rt.cfg.effective_ann_floor();
+    search::search_with_confidence(
         query,
         rt.store,
         rt.embedder,
@@ -2152,11 +2400,21 @@ fn migrate_source_if_legacy(name: &str, root: &Path) -> Result<bool> {
 
 // ---------------- config writer ----------------
 
-/// Write `[source] mode = "<value>"` into the source's central `config.toml`, preserving every
-/// other line in the file. If the file doesn't exist yet, creates a minimal one. We do
+/// Set `[source] mode = "<value>"` in the source's central `config.toml`.
+fn write_source_mode(config_path: &Path, mode: &str) -> Result<()> {
+    write_config_value(config_path, "source", "mode", &format!("\"{mode}\""))
+}
+
+/// Set `<section>.<key> = <value_literal>` in a config.toml, preserving every other line.
+/// `value_literal` is written verbatim (already-quoted strings, bare numbers, etc.). We do
 /// line-level surgery rather than load → mutate → toml::to_string because the TOML library
 /// drops comments + formatting on round-trip, which would be hostile to user-edited files.
-fn write_source_mode(config_path: &Path, mode: &str) -> Result<()> {
+fn write_config_value(
+    config_path: &Path,
+    section: &str,
+    key: &str,
+    value_literal: &str,
+) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
@@ -2167,49 +2425,51 @@ fn write_source_mode(config_path: &Path, mode: &str) -> Result<()> {
         String::new()
     };
 
-    let new_assignment = format!("mode = \"{mode}\"");
+    let section_header = format!("[{section}]");
+    let new_assignment = format!("{key} = {value_literal}");
     let lines: Vec<&str> = existing.lines().collect();
     let mut out = String::new();
-    let mut in_source_section = false;
-    let mut wrote_mode = false;
-    let mut has_source_section = false;
+    let mut in_section = false;
+    let mut wrote_key = false;
+    let mut has_section = false;
 
     for line in &lines {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            // Leaving the previous section. If we were in [source] and never wrote the mode,
-            // append it now.
-            if in_source_section && !wrote_mode {
+            // Leaving the previous section. If we were in the target section and never wrote
+            // the key, append it now.
+            if in_section && !wrote_key {
                 out.push_str(&new_assignment);
                 out.push('\n');
-                wrote_mode = true;
+                wrote_key = true;
             }
-            in_source_section = trimmed == "[source]";
-            if in_source_section {
-                has_source_section = true;
+            in_section = trimmed == section_header;
+            if in_section {
+                has_section = true;
             }
             out.push_str(line);
             out.push('\n');
             continue;
         }
-        if in_source_section && trimmed.starts_with("mode") && trimmed.contains('=') {
+        if in_section && trimmed.starts_with(key) && trimmed.contains('=') {
             out.push_str(&new_assignment);
             out.push('\n');
-            wrote_mode = true;
+            wrote_key = true;
             continue;
         }
         out.push_str(line);
         out.push('\n');
     }
-    if in_source_section && !wrote_mode {
+    if in_section && !wrote_key {
         out.push_str(&new_assignment);
         out.push('\n');
     }
-    if !has_source_section {
+    if !has_section {
         if !out.is_empty() && !out.ends_with("\n\n") {
             out.push('\n');
         }
-        out.push_str("[source]\n");
+        out.push_str(&section_header);
+        out.push('\n');
         out.push_str(&new_assignment);
         out.push('\n');
     }
@@ -2226,6 +2486,63 @@ fn sha256_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+#[cfg(test)]
+mod calibrate_tests {
+    use super::{choose_floor, positive_query};
+
+    #[test]
+    fn choose_floor_keeps_positives_above_and_clamps() {
+        // 10th percentile of positives, clamped to [0.20, 0.70].
+        let pos = vec![0.5, 0.55, 0.6, 0.62, 0.65, 0.7, 0.72, 0.75, 0.8, 0.9];
+        let f = choose_floor(&pos, &[]);
+        assert!((0.20..=0.70).contains(&f));
+        assert!(f <= 0.55, "floor should sit near the low end of positives");
+        // Empty positives → default.
+        assert_eq!(choose_floor(&[], &[]), crate::search::DEFAULT_ANN_FLOOR);
+        // Sky-high positives clamp to the 0.70 ceiling.
+        assert_eq!(choose_floor(&[0.95f32; 10], &[]), 0.70);
+    }
+
+    #[test]
+    fn choose_floor_anchors_below_natural_language_positives_via_negatives() {
+        // Code-shaped positives skew high; real NL positives + negatives sit lower. With
+        // negatives present, the floor must drop below the positive p10 so NL queries aren't
+        // clipped — this is the code over-flag fix.
+        let pos = vec![0.60, 0.65, 0.70, 0.72, 0.74, 0.76, 0.80, 0.82, 0.88, 0.92];
+        let neg = vec![0.30, 0.35, 0.40, 0.45, 0.47, 0.49];
+        let floor_no_neg = choose_floor(&pos, &[]);
+        let floor_with_neg = choose_floor(&pos, &neg);
+        assert!(
+            floor_with_neg < floor_no_neg,
+            "negatives should pull the floor down ({floor_with_neg} !< {floor_no_neg})"
+        );
+        // A legitimate NL query at 0.52 (above the negatives) must NOT be flagged.
+        assert!(
+            floor_with_neg < 0.52,
+            "floor {floor_with_neg} would clip a real NL query"
+        );
+        // ...but a nonsense query at 0.45 (within the negatives) must still be flagged.
+        assert!(
+            floor_with_neg > 0.45,
+            "floor {floor_with_neg} would miss a nonsense query"
+        );
+    }
+
+    #[test]
+    fn positive_query_prefers_last_heading_then_content() {
+        assert_eq!(
+            positive_query(
+                "Vault index > technology/Reciprocal Rank Fusion",
+                "body text here"
+            ),
+            "Reciprocal Rank Fusion"
+        );
+        // Short/empty heading falls back to first content words.
+        let q = positive_query("", "the quick brown fox jumps over the lazy dog again");
+        assert_eq!(q, "the quick brown fox jumps over the lazy");
+    }
 }
 
 #[cfg(test)]

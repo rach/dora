@@ -201,7 +201,7 @@ fn similarity_edges(store: &Store, out: &mut Vec<(i64, i64, &'static str, f64)>)
     Ok(())
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }

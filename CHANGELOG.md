@@ -6,6 +6,36 @@ All notable changes to dora are documented here. Format roughly follows
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-04
+
+### Added
+
+- **Retrieval confidence signal.** Every search now carries a result-set `low_confidence`
+  flag and per-hit `confidence`, computed from calibrated evidence (top vector cosine,
+  file-level cross-arm agreement, and a literal/exact-match override) — NOT the
+  uncalibrated RRF score. Lets agents and users tell a real answer from a "generic
+  attractor" the index surfaces when the vault has nothing relevant.
+- `dora calibrate [<name>]` derives a per-source `[confidence] ann_floor` from the
+  source's own index (sampling positive queries from its headings/symbols and negatives
+  from other sources + generic prompts), so the floor fits your corpus + embedder instead
+  of a provisional default. The floor is anchored to the negative distribution so
+  natural-language questions on code sources aren't over-flagged.
+- `dora explain` now prints the confidence inputs (top cosine, floor, file/chunk
+  agreement, literal match, margin) so the decision is auditable.
+
+### Changed
+
+- **Breaking (`--json` / MCP):** `dora "query" --json` and the MCP `search` tool now
+  return a confidence envelope `{ low_confidence, confidence, hits }` instead of a bare
+  hit array. Each hit gains a `confidence` field. The read-only web UI response is
+  unchanged.
+- The CLI prints `no strong match — closest guesses:` (to stderr, pipe-safe) when a search
+  is low-confidence.
+- Reworded the MCP `min_score` parameter docs: it filters on the uncalibrated RRF score
+  and is NOT a confidence gate — use `low_confidence` / `confidence` for quality.
+- The grep/rg/ag/find wrappers are unchanged this release: they do not suppress
+  low-confidence results yet (suppression waits until calibrated floors are proven).
+
 ## [0.9.0] — 2026-06-03
 
 ### Changed

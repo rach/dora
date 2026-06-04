@@ -29,6 +29,40 @@ pub struct Config {
     pub claude_code: ClaudeCodeConfig,
     pub codex: CodexConfig,
     pub graph: GraphConfig,
+    pub confidence: ConfidenceConfig,
+}
+
+/// `[confidence]` settings. `ann_floor` is the top-ANN-cosine threshold below which a result
+/// set is flagged low-confidence (absent literal/file-agreement evidence). When unset, the
+/// effective floor falls back to a per-embedder/mode default — `dora calibrate` derives a real
+/// value from the source's own index and writes it here.
+#[derive(Debug, Clone, Default)]
+pub struct ConfidenceConfig {
+    pub ann_floor: Option<f32>,
+}
+
+impl Config {
+    /// The ANN-cosine floor to use for the low-confidence gate: the calibrated/configured value
+    /// if present, otherwise a provisional per-embedder-family / per-mode default.
+    pub fn effective_ann_floor(&self) -> f32 {
+        self.confidence
+            .ann_floor
+            .unwrap_or_else(|| default_ann_floor(&self.embedder.model, &self.source.mode))
+    }
+}
+
+/// Provisional per-embedder-family / per-mode cosine floors, used until `dora calibrate`
+/// writes a data-derived value. Deliberately conservative; these are guesses, not gospel.
+fn default_ann_floor(model: &str, mode: &str) -> f32 {
+    let m = model.to_lowercase();
+    if mode == "code" || (m.contains("jina") && m.contains("code")) {
+        0.40
+    } else if m.contains("embeddinggemma") || m.contains("gemma") {
+        0.50
+    } else {
+        // bge-*, e5-*, minilm, openai, and anything else → the shared default.
+        crate::search::DEFAULT_ANN_FLOOR
+    }
 }
 
 /// `[graph]` settings (Layer B derived edges). `entities` opts into the GLiNER entity-edge
@@ -141,6 +175,13 @@ struct RawConfig {
     claude_code: RawClaudeCodeConfig,
     codex: RawCodexConfig,
     graph: RawGraphConfig,
+    confidence: RawConfidenceConfig,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RawConfidenceConfig {
+    ann_floor: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -280,6 +321,9 @@ impl Config {
             },
             graph: GraphConfig {
                 entities: raw.graph.entities.unwrap_or(false),
+            },
+            confidence: ConfidenceConfig {
+                ann_floor: raw.confidence.ann_floor,
             },
         }
     }

@@ -1081,8 +1081,8 @@ impl Store {
     // ---------- derived graph edges (Layer B) ----------
 
     /// Read a chunk's stored embedding back out of the sqlite-vec virtual table, decoded to
-    /// f32. Used to build the kNN similarity graph. Returns None if the chunk has no vector.
-    #[cfg(test)]
+    /// f32. Used by the confidence signal (top-hit cosine) and the kNN similarity graph.
+    /// Returns None if the chunk has no vector.
     pub fn fetch_chunk_embedding(&self, chunk_id: i64) -> Result<Option<Vec<f32>>> {
         let blob: rusqlite::Result<Vec<u8>> = self.conn.query_row(
             "SELECT embedding FROM chunks_vec WHERE chunk_id = ?",

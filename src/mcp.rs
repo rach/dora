@@ -43,8 +43,10 @@ struct SearchArgs {
     /// Path-prefix filter applied within each searched source (e.g. "Daily/").
     #[serde(default)]
     path_prefix: Option<String>,
-    /// Drop hits whose RRF score is below this threshold. Combine with `all` for
-    /// "every relevant document above this confidence" flows.
+    /// Drop hits whose raw RRF rank-fusion score is below this threshold. NOTE: this is an
+    /// uncalibrated ranking score, NOT a confidence/quality gate — use the result-set
+    /// `low_confidence` flag and per-hit `confidence` for that. Mainly a power-user knob to
+    /// thin long tails; combine with `all` to enumerate everything above a cutoff.
     #[serde(default)]
     min_score: Option<f64>,
     /// Disable the top_k cap and return every hit that passed `min_score` (if set, else
@@ -455,6 +457,8 @@ async fn handle_search(
         and_queries: args.and.unwrap_or_default(),
         not_queries: args.not.unwrap_or_default(),
         diagnostics: false,
+        // Overridden per-source from each source's config inside search_with_self_heal.
+        ann_floor: crate::search::DEFAULT_ANN_FLOOR,
     };
 
     let mut guard = state
@@ -462,14 +466,14 @@ async fn handle_search(
         .map_err(|e| ErrorData::internal_error(format!("state lock poisoned: {e}"), None))?;
     let multi = &mut *guard;
 
-    let hits = run_search_on_state(multi, &args.query, args.source.as_deref(), opts)
+    let result = run_search_on_state(multi, &args.query, args.source.as_deref(), opts)
         .map_err(|e| ErrorData::internal_error(format!("search failed: {e}"), None))?;
 
     // Stash this search in the ring buffer so a subsequent `multi_get` can attribute reads
     // back to it. Each `Hit` already knows its source name (set by `search::search`); we
     // group by that so cross-source searches still attribute correctly.
     let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
-    for h in &hits {
+    for h in &result.hits {
         by_source
             .entry(h.source.clone())
             .or_default()
@@ -479,8 +483,10 @@ async fn handle_search(
         multi.record_search(&src, &args.query, paths);
     }
 
-    let json = serde_json::to_string(&hits)
-        .map_err(|e| ErrorData::internal_error(format!("serialize hits: {e}"), None))?;
+    // Return the confidence envelope so agents can tell a strong match from a generic
+    // attractor and avoid quoting a weak hit as authoritative.
+    let json = serde_json::to_string(&result)
+        .map_err(|e| ErrorData::internal_error(format!("serialize results: {e}"), None))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
@@ -965,7 +971,7 @@ fn search_one(
     s: &mut SourceState,
     query: &str,
     opts: crate::search::SearchOptions<'_>,
-) -> Result<Vec<crate::search::Hit>> {
+) -> Result<crate::search::SearchResultSet> {
     crate::search_with_self_heal(
         crate::SearchRuntime {
             source_root: &s.path,
@@ -985,7 +991,7 @@ fn run_search_on_state(
     query: &str,
     source: Option<&str>,
     opts: crate::search::SearchOptions<'_>,
-) -> Result<Vec<crate::search::Hit>> {
+) -> Result<crate::search::SearchResultSet> {
     match source {
         Some(name) => {
             if !multi.sources.contains_key(name) {
@@ -1033,7 +1039,7 @@ fn search_cross(
     multi: &mut MultiSourceState,
     query: &str,
     opts: crate::search::SearchOptions<'_>,
-) -> Result<Vec<crate::search::Hit>> {
+) -> Result<crate::search::SearchResultSet> {
     // Per-source over-fetch only when we'd otherwise truncate. With `all`, fetch every hit.
     let per_source_opts = if opts.all {
         opts.clone()
@@ -1044,10 +1050,28 @@ fn search_cross(
         }
     };
     let mut all: Vec<crate::search::Hit> = Vec::new();
+    // Track the most-confident source's confidence; the cross-source set is low-confidence
+    // only when *every* searched source came back low-confidence.
+    let mut best: Option<crate::search::ResultConfidence> = None;
+    let mut any_searched = false;
+    let mut all_low = true;
     for name in multi.order.clone() {
         let s = multi.sources.get_mut(&name).expect("name in order");
         match search_one(s, query, per_source_opts.clone()) {
-            Ok(hits) => all.extend(hits),
+            Ok(rs) => {
+                any_searched = true;
+                if !rs.confidence.low_confidence {
+                    all_low = false;
+                }
+                if best
+                    .as_ref()
+                    .map(|b| rs.confidence.score > b.score)
+                    .unwrap_or(true)
+                {
+                    best = Some(rs.confidence.clone());
+                }
+                all.extend(rs.hits);
+            }
             Err(e) => {
                 // Don't fail the whole call because one source errored — log + continue.
                 eprintln!("dora mcp: source '{name}' search failed: {e}");
@@ -1062,7 +1086,26 @@ fn search_cross(
     if !opts.all {
         all.truncate(opts.top_k);
     }
-    Ok(all)
+    let low_confidence = !any_searched || all_low;
+    let confidence = best.unwrap_or(crate::search::ResultConfidence {
+        score: 0.0,
+        low_confidence,
+        top_ann_similarity: None,
+        ann_floor: opts.ann_floor,
+        file_agreement: false,
+        chunk_agreement: false,
+        strong_literal: false,
+        top1_top2_margin: None,
+    });
+    let confidence = crate::search::ResultConfidence {
+        low_confidence,
+        ..confidence
+    };
+    Ok(crate::search::SearchResultSet {
+        low_confidence,
+        confidence,
+        hits: all,
+    })
 }
 
 // ---------------- entrypoints ----------------
@@ -1303,8 +1346,10 @@ async fn api_search(
     let mut guard = state
         .lock()
         .map_err(|e| ApiError::internal(format!("state lock poisoned: {e}")))?;
+    // The read-only web UI renders a flat hit list; keep its response shape unchanged
+    // (the confidence envelope is for the CLI/MCP surfaces).
     run_search_on_state(&mut guard, query, source, opts)
-        .map(axum::Json)
+        .map(|rs| axum::Json(rs.hits))
         .map_err(|e| ApiError::bad_request(format!("{e}")))
 }
 
@@ -1531,7 +1576,7 @@ fn build_search_schema(source_summary: &str) -> serde_json::Map<String, serde_js
             },
             "min_score": {
                 "type": "number",
-                "description": "Drop hits whose merged RRF score is below this threshold. Combine with `all: true` for 'every relevant doc above this confidence' agentic flows."
+                "description": "Drop hits whose raw RRF rank-fusion score is below this threshold. This is an UNCALIBRATED ranking score, not a confidence gate — read the result-set `low_confidence` flag and per-hit `confidence` for quality. A power-user knob for thinning long tails; combine with `all: true` to enumerate everything above a cutoff."
             },
             "all": {
                 "type": "boolean",
