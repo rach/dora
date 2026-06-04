@@ -78,8 +78,7 @@ pub struct ResultConfidence {
 }
 
 /// Envelope returned by `search_with_confidence`: the ranked hits plus the result-set
-/// confidence. `search()` remains the thin `Vec<Hit>` entry point for callers that don't
-/// need confidence (eval, etc.).
+/// confidence. Callers that don't need confidence just read `.hits`.
 #[derive(Debug, Serialize)]
 pub struct SearchResultSet {
     pub low_confidence: bool,
@@ -222,18 +221,6 @@ pub fn search_with_confidence(
         confidence,
         hits,
     })
-}
-
-/// Thin `Vec<Hit>` entry point for callers that don't need confidence (eval, etc.).
-pub fn search(
-    query: &str,
-    store: &Store,
-    embedder: &dyn Embedder,
-    source_root: &Path,
-    source_name: &str,
-    opts: SearchOptions<'_>,
-) -> Result<Vec<Hit>> {
-    Ok(search_with_confidence(query, store, embedder, source_root, source_name, opts)?.hits)
 }
 
 pub fn explain(

@@ -261,7 +261,7 @@ fn run_eval_in_temp(
 
     let mut outcomes = Vec::with_capacity(queries.len());
     for q in queries {
-        let hits = crate::search::search(
+        let hits = crate::search::search_with_confidence(
             &q.query,
             &store,
             embedder.as_ref(),
@@ -272,7 +272,8 @@ fn run_eval_in_temp(
                 diagnostics: true,
                 ..Default::default()
             },
-        )?;
+        )?
+        .hits;
         let relevant: HashSet<&str> = q.relevant.iter().map(String::as_str).collect();
         let rank = hits
             .iter()
